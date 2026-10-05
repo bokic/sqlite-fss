@@ -21,6 +21,9 @@ For a table with 6 columns, standard SQLite burns **10 to 18 bytes of pure metad
 #### How FSS Achieves Smaller File Sizes:
 - **Schema Stored Once:** The field types, byte widths, and nullability flags are written exactly once in the page preamble (~14–20 bytes total for the whole 4KB page).
 - **Zero Per-Row Serial Types:** Individual rows contain only raw binary data values (plus an optional null bitmask).
+- **Elimination of the Row Offset Table (Cell Pointer Array):** Standard SQLite allocates a 2-byte integer offset (`aCellIdx`) for every single row at the top of the page. Because FSS rows have a fixed, identical payload size, this entire table is removed. The byte location of row $i$ is calculated directly via $O(1)$ pointer arithmetic:
+  $$\text{RowOffset}(i) = \text{DataAreaOffset} + (i \times \text{RowSize})$$
+  This instantly saves **2 bytes per row** on disk and eliminates cell pointer array shifting on inserts and deletes.
 - **Storage Savings:** Databases storing structured or time-series data typically achieve a **20% to 35%+ reduction in total database file size**.
 
 | Scenario (4096-Byte Page) | Standard SQLite (`0x0D`) | Fixed-Schema Leaf (`0x0E`) | Savings |
@@ -67,6 +70,7 @@ The reduction in file size and adoption of fixed-size slots unlock substantial p
 |---|---|---|
 | **Database File Size** | Baseline (repeats type tags every row) | **20%–35% smaller** |
 | **Schema Representation** | Dynamic per row (varints) | Once per page header |
+| **Row Offset Table (Cell Pointers)** | 2 bytes per row (`aCellIdx`) | **Eliminated** ($O(1)$ arithmetic calculation) |
 | **Row Count Invariant** | 0 or more cells | **1 or more data rows** |
 | **Column Projection** | $O(N)$ varint traversal per row | **$O(1)$ direct pointer arithmetic** |
 | **Page Defragmentation** | Frequent (`defragmentPage()`) | **None** (slot bitmask tombstones) |
