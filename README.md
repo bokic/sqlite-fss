@@ -75,6 +75,31 @@ The reduction in file size and adoption of fixed-size slots unlock substantial p
 
 ---
 
+## ⚙️ Enabling Fixed-Schema Storage (PRAGMA Syntax)
+
+By default, Fixed-Schema Storage is **disabled (`OFF`)** to preserve strict standard SQLite page behavior.
+
+To inspect or toggle the feature at runtime, use the following PRAGMA syntax:
+
+```sql
+-- Query current status (returns 0 for OFF, 1 for ON)
+PRAGMA fixed_schema;
+-- or using the alias:
+PRAGMA fss;
+
+-- Enable the feature
+PRAGMA fixed_schema = ON;   -- also accepts 1, YES, TRUE
+-- or using the alias:
+PRAGMA fss = ON;
+
+-- Disable the feature (default)
+PRAGMA fixed_schema = OFF;  -- also accepts 0, NO, FALSE
+-- or using the alias:
+PRAGMA fss = OFF;
+```
+
+---
+
 ## 📖 Detailed Specification
 
-For complete binary layout offsets, header field structures, and demotion state-machine details, see [DESIGN.md](file:///home/boris/projects/sqlite_new_chunk_type/DESIGN.md).
+For complete binary layout offsets, header field structures, and demotion state-machine details, see [DESIGN.md](file:///home/boris/projects/sqlite-fss/DESIGN.md).
