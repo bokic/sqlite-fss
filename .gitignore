@@ -1,0 +1,19 @@
+# SQLite upstream checkout
+sqlite/
+
+# Build artifacts
+*.o
+*.a
+*.so
+bin/
+benchmark/benchmark
+
+# Database files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# OS / Editor artifacts
+.DS_Store
+*.swp

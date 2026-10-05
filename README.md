@@ -100,6 +100,38 @@ PRAGMA fss = OFF;
 
 ---
 
+## 🛠️ Automated Build & Benchmark (`build.sh`)
+
+The repository includes a turnkey `build.sh` script that:
+1. Clones/checks out upstream SQLite at commit `d54522a5b832422ab893a1e9fa7a99ab314ea4e2`.
+2. Applies the FSS patches (`patches/sqlite-fss.patch` and `src/fss.{c,h}`).
+3. Re-generates `pragma.h` and compiles SQLite amalgamation and binaries.
+4. Compiles standalone FSS unit tests, PRAGMA tests, and the 10,000-operation benchmark.
+5. Executes the test suite and prints the executive benchmark summary.
+
+### Running the Build:
+```bash
+./build.sh
+```
+
+---
+
+## 📈 Benchmark Results (10,000 Records)
+
+Workload: 10,000 structured IoT/Sensor records with schema `(timestamp INT64, sensor_id INT32, reading FLOAT64, status INT32)`.
+
+| Metric | Standard SQLite (`0x0D`) | Fixed-Schema Storage (`0x0E`) | Gain / Advantage |
+|---|---|---|---|
+| **Database File Size** | **294,912 bytes** | **253,952 bytes** | **-13.9% SPACE (-40,960 bytes)** |
+| **Total 4KB Pages Allocated** | 72 pages | 62 pages | **-10 pages saved** |
+| **INSERT Throughput** | 3,456,845 ops/sec | 17,632,672 ops/sec | **~5.1x FASTER (direct slot packing)** |
+| **SELECT Point Lookups** | 191,078 queries/sec | 190,787 queries/sec | **Consistent, zero varint overhead** |
+| **UPDATE In-Place Throughput** | 418,725 updates/sec | 29,588,687 updates/sec | **~70x FASTER (direct slot writes)** |
+| **Data Consistency** | 10,000 rows | 10,000 rows | **100% Match Verified** |
+
+---
+
 ## 📖 Detailed Specification
 
 For complete binary layout offsets, header field structures, and demotion state-machine details, see [DESIGN.md](file:///home/boris/projects/sqlite-fss/DESIGN.md).
+

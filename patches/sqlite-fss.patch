@@ -1,0 +1,302 @@
+diff --git a/src/btree.c b/src/btree.c
+index 8b730508c..2baea8f17 100644
+--- a/src/btree.c
++++ b/src/btree.c
+@@ -1191,9 +1191,14 @@ static int ptrmapGet(BtShared *pBt, Pgno key, u8 *pEType, Pgno *pPgno){
+ ** This routine works only for pages that do not contain overflow cells.
+ */
+ #define findCell(P,I) \
+-  ((P)->aData + ((P)->maskPage & get2byteAligned(&(P)->aCellIdx[2*(I)])))
++  (((P)->aData[(P)->hdrOffset]==PTF_FSS_LEAF && ((P)->pBt->db!=0 && ((P)->pBt->db->flags & SQLITE_FixedSchema)!=0)) ? \
++   fssFindCell((P),(I)) : \
++   ((P)->aData + ((P)->maskPage & get2byteAligned(&(P)->aCellIdx[2*(I)]))))
+ #define findCellPastPtr(P,I) \
+-  ((P)->aDataOfst + ((P)->maskPage & get2byteAligned(&(P)->aCellIdx[2*(I)])))
++  (((P)->aData[(P)->hdrOffset]==PTF_FSS_LEAF && ((P)->pBt->db!=0 && ((P)->pBt->db->flags & SQLITE_FixedSchema)!=0)) ? \
++   fssFindCell((P),(I)) : \
++   ((P)->aDataOfst + ((P)->maskPage & get2byteAligned(&(P)->aCellIdx[2*(I)]))))
++
+ 
+ 
+ /*
+@@ -1590,6 +1595,57 @@ static u16 cellSizePtrTableLeaf(MemPage *pPage, u8 *pCell){
+   return (u16)nSize;
+ }
+ 
++/*
++** Routines for Fixed-Schema Storage (FSS) leaf pages (0x0E).
++*/
++u8 *fssFindCell(MemPage *pPage, int iCell){
++  u8 *data = pPage->aData + pPage->hdrOffset;
++  u16 dataAreaOffset = get2byte(&data[12]);
++  u16 rowPayloadSize = get2byte(&data[8]);
++  return data + dataAreaOffset + (iCell * rowPayloadSize);
++}
++
++u16 fssCellSizePtr(MemPage *pPage, u8 *pCell){
++  (void)pCell;
++  u8 *data = pPage->aData + pPage->hdrOffset;
++  return get2byte(&data[8]);
++}
++
++i64 fssGetRowid(MemPage *pPage, int iCell){
++  u8 *data = pPage->aData + pPage->hdrOffset;
++  u8 flags = data[1];
++  u16 nCols = get2byte(&data[16]);
++  u16 descSize = 2 + nCols * 4;
++  if( flags & 0x01 ){ /* FSS_FLAG_DENSE_ROWID */
++    u8 *pMin = &data[16 + descSize];
++    u64 v = 0;
++    int i;
++    for( i=0; i<8; i++ ){ v = (v<<8) | pMin[i]; }
++    return (i64)v + iCell;
++  }else{
++    u8 *pRid = &data[16 + descSize + iCell * 8];
++    u64 v = 0;
++    int i;
++    for( i=0; i<8; i++ ){ v = (v<<8) | pRid[i]; }
++    return (i64)v;
++  }
++}
++
++void btreeParseCellPtrFss(MemPage *pPage, u8 *pCell, CellInfo *pInfo){
++  u8 *data = pPage->aData + pPage->hdrOffset;
++  u16 rowPayloadSize = get2byte(&data[8]);
++  u16 dataAreaOffset = get2byte(&data[12]);
++  int iCell = 0;
++  if( rowPayloadSize>0 ){
++    iCell = (int)((pCell - (data + dataAreaOffset)) / rowPayloadSize);
++  }
++
++  pInfo->nKey = fssGetRowid(pPage, iCell);
++  pInfo->pPayload = pCell;
++  pInfo->nPayload = rowPayloadSize;
++  pInfo->nLocal = rowPayloadSize;
++  pInfo->nSize = rowPayloadSize;
++}
+ 
+ #ifdef SQLITE_DEBUG
+ /* This variation on cellSizePtr() is used inside of assert() statements
+@@ -2069,6 +2125,13 @@ static int decodeFlags(MemPage *pPage, int flagByte){
+       pPage->intKey = 1;
+       pPage->maxLocal = pBt->maxLeaf;
+       pPage->minLocal = pBt->minLeaf;
++    }else if( flagByte==PTF_FSS_LEAF && (pBt->db!=0 && (pBt->db->flags & SQLITE_FixedSchema)!=0) ){
++      pPage->intKeyLeaf = 1;
++      pPage->xCellSize = fssCellSizePtr;
++      pPage->xParseCell = btreeParseCellPtrFss;
++      pPage->intKey = 1;
++      pPage->maxLocal = pBt->maxLeaf;
++      pPage->minLocal = pBt->minLeaf;
+     }else if( flagByte==(PTF_ZERODATA | PTF_LEAF) ){
+       pPage->intKey = 0;
+       pPage->intKeyLeaf = 0;
+@@ -2272,8 +2335,13 @@ static int btreeInitPage(MemPage *pPage){
+   pPage->aDataEnd = pPage->aData + pBt->pageSize;
+   pPage->aDataOfst = pPage->aData + pPage->childPtrSize;
+   /* EVIDENCE-OF: R-37002-32774 The two-byte integer at offset 3 gives the
+-  ** number of cells on the page. */
+-  pPage->nCell = get2byte(&data[3]);
++  ** number of cells on the page. In FSS pages (0x0E), cell_count is at offset 4. */
++  if( data[0]==PTF_FSS_LEAF && (pBt->db!=0 && (pBt->db->flags & SQLITE_FixedSchema)!=0) ){
++    pPage->nCell = get2byte(&data[4]);
++  }else{
++    pPage->nCell = get2byte(&data[3]);
++  }
++
+   if( pPage->nCell>MX_CELL(pBt) ){
+     /* To many cells for a single page.  The page must be corrupt */
+     return SQLITE_CORRUPT_PAGE(pPage);
+@@ -5920,15 +5988,19 @@ int sqlite3BtreeTableMoveto(
+     idx = upr>>(1-biasRight); /* idx = biasRight ? upr : (lwr+upr)/2; */
+     for(;;){
+       i64 nCellKey;
+-      pCell = findCellPastPtr(pPage, idx);
+-      if( pPage->intKeyLeaf ){
+-        while( 0x80 <= *(pCell++) ){
+-          if( pCell>=pPage->aDataEnd ){
+-            return SQLITE_CORRUPT_PAGE(pPage);
++      if( pPage->aData[pPage->hdrOffset] == PTF_FSS_LEAF ){
++        nCellKey = fssGetRowid(pPage, idx);
++      }else{
++        pCell = findCellPastPtr(pPage, idx);
++        if( pPage->intKeyLeaf ){
++          while( 0x80 <= *(pCell++) ){
++            if( pCell>=pPage->aDataEnd ){
++              return SQLITE_CORRUPT_PAGE(pPage);
++            }
+           }
+         }
++        nCellKey = sqlite3VarintValue(pCell);
+       }
+-      nCellKey = sqlite3VarintValue(pCell);
+       if( nCellKey<intKey ){
+         lwr = idx+1;
+         if( lwr>upr ){ c = -1; break; }
+diff --git a/src/btreeInt.h b/src/btreeInt.h
+index 5bc24b349..c9c68bf71 100644
+--- a/src/btreeInt.h
++++ b/src/btreeInt.h
+@@ -257,6 +257,19 @@ typedef struct CellInfo CellInfo;
+ #define PTF_ZERODATA  0x02
+ #define PTF_LEAFDATA  0x04
+ #define PTF_LEAF      0x08
++#define PTF_FSS_LEAF  0x0e
++
++/*
++** Prototypes for Fixed-Schema Storage (FSS) leaf page handlers.
++*/
++u8 *fssFindCell(MemPage *pPage, int iCell);
++u16 fssCellSizePtr(MemPage *pPage, u8 *pCell);
++void btreeParseCellPtrFss(MemPage *pPage, u8 *pCell, CellInfo *pInfo);
++i64 fssGetRowid(MemPage *pPage, int iCell);
++void fssExtractColumn(MemPage *pPage, const u8 *pCell, int iCol, Mem *pDest);
++int fssInitPageFromRecord(MemPage *pPage, const u8 *pData, int nData);
++int fssInsertRecord(MemPage *pPage, i64 rowid, const u8 *pData, int nData);
++
+ 
+ /*
+ ** An instance of this object stores information about each a single database
+diff --git a/src/sqliteInt.h b/src/sqliteInt.h
+index f0c169c8d..637e43306 100644
+--- a/src/sqliteInt.h
++++ b/src/sqliteInt.h
+@@ -1906,6 +1906,7 @@ struct sqlite3 {
+ #define SQLITE_AttachCreate   HI(0x00010) /* ATTACH allowed to create new dbs */
+ #define SQLITE_AttachWrite    HI(0x00020) /* ATTACH allowed to open for write */
+ #define SQLITE_Comments       HI(0x00040) /* Enable SQL comments */
++#define SQLITE_FixedSchema    HI(0x00080) /* Enable Fixed-Schema Storage (FSS) */
+ 
+ /* Flags used only if debugging */
+ #ifdef SQLITE_DEBUG
+diff --git a/src/vdbe.c b/src/vdbe.c
+index f7358a6cb..a11f7511b 100644
+--- a/src/vdbe.c
++++ b/src/vdbe.c
+@@ -895,6 +895,87 @@ static const char *vdbeMemTypeName(Mem *pMem){
+   return azTypes[sqlite3_value_type(pMem)-1];
+ }
+ 
++void fssExtractColumn(MemPage *pPage, const u8 *pSlot, int iCol, Mem *pDest){
++  u8 *data = pPage->aData + pPage->hdrOffset;
++  u8 flags = data[1];
++  u16 nCols = get2byte(&data[16]);
++  u16 nullBytes = (flags & 0x02) ? ((nCols + 7) / 8) : 0;
++  int i;
++  u16 offset = 0;
++  if( iCol < 0 || iCol >= nCols ){
++    sqlite3VdbeMemSetNull(pDest);
++    return;
++  }
++  if( nullBytes > 0 ){
++    if( pSlot[iCol / 8] & (1 << (iCol % 8)) ){
++      sqlite3VdbeMemSetNull(pDest);
++      return;
++    }
++  }
++  for( i = 0; i < iCol; i++ ){
++    u8 *desc = &data[18 + i * 4];
++    offset += get2byte(&desc[2]);
++  }
++  u8 *desc = &data[18 + iCol * 4];
++  u8 type_id = desc[0];
++  u16 width = get2byte(&desc[2]);
++  const u8 *pSrc = pSlot + nullBytes + offset;
++  switch( type_id ){
++    case 0x01: { /* INT8 / BOOL */
++      pDest->flags = MEM_Int;
++      pDest->u.i = (signed char)*pSrc;
++      break;
++    }
++    case 0x02: { /* INT16 */
++      pDest->flags = MEM_Int;
++      pDest->u.i = (i16)get2byte(pSrc);
++      break;
++    }
++    case 0x03: { /* INT32 */
++      pDest->flags = MEM_Int;
++      pDest->u.i = (int)get4byte(pSrc);
++      break;
++    }
++    case 0x04:
++    case 0x08: { /* INT64 / TIMESTAMP */
++      u64 v = 0;
++      for( i=0; i<8; i++ ) v = (v<<8) | pSrc[i];
++      pDest->flags = MEM_Int;
++      pDest->u.i = (i64)v;
++      break;
++    }
++    case 0x05: { /* FLOAT32 */
++      u32 u = get4byte(pSrc);
++      float f;
++      memcpy(&f, &u, 4);
++      pDest->flags = MEM_Real;
++      pDest->u.r = (double)f;
++      break;
++    }
++    case 0x06: { /* FLOAT64 */
++      u64 u = 0;
++      for( i=0; i<8; i++ ) u = (u<<8) | pSrc[i];
++      double d;
++      memcpy(&d, &u, 8);
++      pDest->flags = MEM_Real;
++      pDest->u.r = d;
++      break;
++    }
++    case 0x07: { /* FIXED_BLOB */
++      sqlite3VdbeMemSetStr(pDest, (const char*)pSrc, width, 0, SQLITE_TRANSIENT);
++      break;
++    }
++    case 0x0A: { /* TEXT */
++      sqlite3VdbeMemSetStr(pDest, (const char*)pSrc, width, SQLITE_UTF8, SQLITE_TRANSIENT);
++      break;
++    }
++    default: {
++      sqlite3VdbeMemSetNull(pDest);
++      break;
++    }
++  }
++}
++
+ /*
+ ** Execute as much of a VDBE program as we can.
+ ** This is the core of sqlite3_step(). 
+@@ -3104,6 +3185,12 @@ op_column_restart:
+       assert( pC->szRow<=pC->payloadSize );
+       assert( pC->szRow<=65536 );  /* Maximum page size is 64KiB */
+     }
++    if( pCrsr && pCrsr->pPage && pCrsr->pPage->aData[pCrsr->pPage->hdrOffset]==PTF_FSS_LEAF ){
++      pDest = &aMem[pOp->p3];
++      memAboutToChange(p, pDest);
++      fssExtractColumn(pCrsr->pPage, pC->aRow, (int)p2, pDest);
++      goto op_column_out;
++    }
+     pC->cacheStatus = p->cacheCtr;
+     if( (aOffset[0] = pC->aRow[0])<0x80 ){
+       pC->iHdrOffset = 1;
+diff --git a/tool/mkpragmatab.tcl b/tool/mkpragmatab.tcl
+index 78127f74a..2b845ebf5 100644
+--- a/tool/mkpragmatab.tcl
++++ b/tool/mkpragmatab.tcl
+@@ -157,6 +157,21 @@ set pragma_def {
+   TYPE: FLAG
+   ARG:  SQLITE_CellSizeCk
+ 
++  NAME: fixed_schema
++  TYPE: FLAG
++  ARG:  SQLITE_FixedSchema
++  IF:   !defined(SQLITE_OMIT_FLAG_PRAGMAS)
++
++  NAME: fss
++  TYPE: FLAG
++  ARG:  SQLITE_FixedSchema
++  IF:   !defined(SQLITE_OMIT_FLAG_PRAGMAS)
++
++  NAME: fixed_schema_storage
++  TYPE: FLAG
++  ARG:  SQLITE_FixedSchema
++  IF:   !defined(SQLITE_OMIT_FLAG_PRAGMAS)
++
+   NAME: default_cache_size
+   FLAG: NeedSchema Result0 SchemaReq NoColumns1
+   COLS: cache_size
