@@ -1,5 +1,26 @@
+diff --git a/main.mk b/main.mk
+index 4a2c28634..f501b7f98 100644
+--- a/main.mk
++++ b/main.mk
+@@ -579,6 +579,8 @@ SRC = \
+   $(TOP)/src/btree.c \
+   $(TOP)/src/btree.h \
+   $(TOP)/src/btreeInt.h \
++  $(TOP)/src/fss.c \
++  $(TOP)/src/fss.h \
+   $(TOP)/src/build.c \
+   $(TOP)/src/callback.c \
+   $(TOP)/src/carray.c \
+@@ -879,6 +881,7 @@ TESTSRC2 = \
+ HDR = \
+    $(TOP)/src/btree.h \
+    $(TOP)/src/btreeInt.h \
++   $(TOP)/src/fss.h \
+    $(TOP)/src/hash.h \
+    $(TOP)/src/hwtime.h \
+    keywordhash.h \
 diff --git a/src/btree.c b/src/btree.c
-index 8b730508c..2baea8f17 100644
+index 8b730508c..e671295f1 100644
 --- a/src/btree.c
 +++ b/src/btree.c
 @@ -1191,9 +1191,14 @@ static int ptrmapGet(BtShared *pBt, Pgno key, u8 *pEType, Pgno *pPgno){
@@ -7,19 +28,19 @@ index 8b730508c..2baea8f17 100644
  */
  #define findCell(P,I) \
 -  ((P)->aData + ((P)->maskPage & get2byteAligned(&(P)->aCellIdx[2*(I)])))
-+  (((P)->aData[(P)->hdrOffset]==PTF_FSS_LEAF && ((P)->pBt->db!=0 && ((P)->pBt->db->flags & SQLITE_FixedSchema)!=0)) ? \
++  (((P)->aData[(P)->hdrOffset]==PTF_FSS_LEAF) ? \
 +   fssFindCell((P),(I)) : \
 +   ((P)->aData + ((P)->maskPage & get2byteAligned(&(P)->aCellIdx[2*(I)]))))
  #define findCellPastPtr(P,I) \
 -  ((P)->aDataOfst + ((P)->maskPage & get2byteAligned(&(P)->aCellIdx[2*(I)])))
-+  (((P)->aData[(P)->hdrOffset]==PTF_FSS_LEAF && ((P)->pBt->db!=0 && ((P)->pBt->db->flags & SQLITE_FixedSchema)!=0)) ? \
++  (((P)->aData[(P)->hdrOffset]==PTF_FSS_LEAF) ? \
 +   fssFindCell((P),(I)) : \
 +   ((P)->aDataOfst + ((P)->maskPage & get2byteAligned(&(P)->aCellIdx[2*(I)]))))
 +
  
  
  /*
-@@ -1590,6 +1595,57 @@ static u16 cellSizePtrTableLeaf(MemPage *pPage, u8 *pCell){
+@@ -1590,6 +1595,175 @@ static u16 cellSizePtrTableLeaf(MemPage *pPage, u8 *pCell){
    return (u16)nSize;
  }
  
@@ -28,30 +49,31 @@ index 8b730508c..2baea8f17 100644
 +*/
 +u8 *fssFindCell(MemPage *pPage, int iCell){
 +  u8 *data = pPage->aData + pPage->hdrOffset;
-+  u16 dataAreaOffset = get2byte(&data[12]);
-+  u16 rowPayloadSize = get2byte(&data[8]);
++  u16 dataAreaOffset = get2byte(&data[FSS_HDR_DATA_AREA_OFFSET]);
++  u16 rowPayloadSize = get2byte(&data[FSS_HDR_ROW_PAYLOAD_SIZE]);
 +  return data + dataAreaOffset + (iCell * rowPayloadSize);
 +}
 +
 +u16 fssCellSizePtr(MemPage *pPage, u8 *pCell){
 +  (void)pCell;
 +  u8 *data = pPage->aData + pPage->hdrOffset;
-+  return get2byte(&data[8]);
++  return get2byte(&data[FSS_HDR_ROW_PAYLOAD_SIZE]);
 +}
 +
 +i64 fssGetRowid(MemPage *pPage, int iCell){
 +  u8 *data = pPage->aData + pPage->hdrOffset;
-+  u8 flags = data[1];
-+  u16 nCols = get2byte(&data[16]);
-+  u16 descSize = 2 + nCols * 4;
-+  if( flags & 0x01 ){ /* FSS_FLAG_DENSE_ROWID */
-+    u8 *pMin = &data[16 + descSize];
++  u8 flags = data[FSS_HDR_FLAGS];
++  u16 fieldDescOffset = get2byte(&data[FSS_HDR_FIELD_DESC_OFFSET]);
++  u16 nCols = get2byte(&data[fieldDescOffset + FSS_SCHEMA_NUM_COLUMNS]);
++  u16 descSize = FSS_SCHEMA_HEADER_SIZE + nCols * FSS_FIELD_DESC_SIZE;
++  u8 *pIndex = data + fieldDescOffset + descSize;
++  if( flags & FSS_FLAG_DENSE_ROWID ){
 +    u64 v = 0;
 +    int i;
-+    for( i=0; i<8; i++ ){ v = (v<<8) | pMin[i]; }
++    for( i=0; i<8; i++ ){ v = (v<<8) | pIndex[i]; }
 +    return (i64)v + iCell;
 +  }else{
-+    u8 *pRid = &data[16 + descSize + iCell * 8];
++    u8 *pRid = pIndex + iCell * 8;
 +    u64 v = 0;
 +    int i;
 +    for( i=0; i<8; i++ ){ v = (v<<8) | pRid[i]; }
@@ -61,27 +83,154 @@ index 8b730508c..2baea8f17 100644
 +
 +void btreeParseCellPtrFss(MemPage *pPage, u8 *pCell, CellInfo *pInfo){
 +  u8 *data = pPage->aData + pPage->hdrOffset;
-+  u16 rowPayloadSize = get2byte(&data[8]);
-+  u16 dataAreaOffset = get2byte(&data[12]);
-+  int iCell = 0;
-+  if( rowPayloadSize>0 ){
-+    iCell = (int)((pCell - (data + dataAreaOffset)) / rowPayloadSize);
++  u16 rowPayloadSize = get2byte(&data[FSS_HDR_ROW_PAYLOAD_SIZE]);
++  u16 dataAreaOffset = get2byte(&data[FSS_HDR_DATA_AREA_OFFSET]);
++  u8 *pDataStart = data + dataAreaOffset;
++  u8 *pDataEnd = pDataStart + (u32)pPage->nCell * rowPayloadSize;
++
++  if( pCell >= pDataStart && pCell < pDataEnd && rowPayloadSize > 0 ){
++    int iCell = (int)((pCell - pDataStart) / rowPayloadSize);
++    pInfo->nKey = fssGetRowid(pPage, iCell);
++    pInfo->pPayload = pCell;
++    pInfo->nPayload = rowPayloadSize;
++    pInfo->nLocal = rowPayloadSize;
++    pInfo->nSize = rowPayloadSize;
++  }else{
++    /* Overflow cell: 8 bytes big-endian rowid followed by payload */
++    pInfo->nKey = (i64)fssGetI64(pCell);
++    pInfo->pPayload = pCell + 8;
++    pInfo->nPayload = rowPayloadSize;
++    pInfo->nLocal = rowPayloadSize;
++    pInfo->nSize = 8 + rowPayloadSize;
++  }
++}
++
++int sqlite3FssValidateDbMarker(const u8 *aDbHdr, u32 *pVersion){
++  const u8 *p;
++  u32 ver;
++  int allZero = 1;
++  int i;
++
++  if( !aDbHdr ) return FSS_MARKER_INVALID;
++  p = aDbHdr + FSS_DB_MARKER_OFFSET;
++
++  for( i = 0; i < FSS_DB_MARKER_SIZE; i++ ){
++    if( p[i] != 0 ){
++      allZero = 0;
++      break;
++    }
++  }
++  if( allZero ){
++    if( pVersion ) *pVersion = 0;
++    return FSS_MARKER_NONE;
 +  }
 +
-+  pInfo->nKey = fssGetRowid(pPage, iCell);
-+  pInfo->pPayload = pCell;
-+  pInfo->nPayload = rowPayloadSize;
-+  pInfo->nLocal = rowPayloadSize;
-+  pInfo->nSize = rowPayloadSize;
++  if( memcmp(p, FSS_DB_MAGIC, FSS_DB_MAGIC_SIZE) == 0 ){
++    ver = ((u32)p[4] << 24) |
++          ((u32)p[5] << 16) |
++          ((u32)p[6] << 8)  |
++          ((u32)p[7]);
++    if( pVersion ) *pVersion = ver;
++    if( ver == FSS_DB_VERSION ){
++      return FSS_MARKER_VALID;
++    }else{
++      return FSS_MARKER_UNSUPPORTED_VER;
++    }
++  }
++
++  if( pVersion ) *pVersion = 0;
++  return FSS_MARKER_INVALID;
 +}
++
++int sqlite3FssWriteDbMarker(u8 *aDbHdr, u32 version){
++  u8 *p;
++  if( !aDbHdr ) return SQLITE_ERROR;
++  p = aDbHdr + FSS_DB_MARKER_OFFSET;
++  memcpy(p, FSS_DB_MAGIC, FSS_DB_MAGIC_SIZE);
++  p[4] = (u8)((version >> 24) & 0xFF);
++  p[5] = (u8)((version >> 16) & 0xFF);
++  p[6] = (u8)((version >> 8) & 0xFF);
++  p[7] = (u8)(version & 0xFF);
++  return SQLITE_OK;
++}
++
++int sqlite3BtreeMarkFss(BtShared *pBt){
++  int rc;
++  assert( sqlite3_mutex_held(pBt->mutex) );
++  if( pBt->pPage1==0 ) return SQLITE_OK;
++  if( (pBt->btsFlags & BTS_FSS)!=0 ){
++    return SQLITE_OK;
++  }
++  rc = sqlite3PagerWrite(pBt->pPage1->pDbPage);
++  if( rc==SQLITE_OK ){
++    sqlite3FssWriteDbMarker(pBt->pPage1->aData, FSS_DB_VERSION);
++    pBt->btsFlags |= BTS_FSS;
++  }
++  return rc;
++}
++
++int sqlite3BtreeSetFssFormat(Btree *p, u32 version){
++  BtShared *pBt;
++  int rc;
++  if( p==0 ) return SQLITE_MISUSE;
++  sqlite3BtreeEnter(p);
++  pBt = p->pBt;
++  if( pBt->pPage1==0 ){
++    sqlite3BtreeLeave(p);
++    return SQLITE_ERROR;
++  }
++  if( version==FSS_DB_VERSION ){
++    rc = sqlite3BtreeMarkFss(pBt);
++  }else{
++    rc = sqlite3PagerWrite(pBt->pPage1->pDbPage);
++    if( rc==SQLITE_OK ){
++      if( version==0 ){
++        memset(pBt->pPage1->aData + FSS_DB_MARKER_OFFSET, 0, FSS_DB_MARKER_SIZE);
++        pBt->btsFlags &= ~BTS_FSS;
++      }else{
++        sqlite3FssWriteDbMarker(pBt->pPage1->aData, version);
++        pBt->btsFlags &= ~BTS_FSS;
++      }
++    }
++  }
++  sqlite3BtreeLeave(p);
++  return rc;
++}
++
++int sqlite3BtreeGetFssFormat(Btree *p){
++  BtShared *pBt;
++  int res = 0;
++  if( p==0 ) return 0;
++  sqlite3BtreeEnter(p);
++  pBt = p->pBt;
++  if( pBt && pBt->pPage1 && pBt->pPage1->aData ){
++    u32 ver = 0;
++    if( sqlite3FssValidateDbMarker(pBt->pPage1->aData, &ver) == FSS_MARKER_VALID ){
++      res = (int)ver;
++    }
++  }
++  sqlite3BtreeLeave(p);
++  return res;
++}
++
  
  #ifdef SQLITE_DEBUG
  /* This variation on cellSizePtr() is used inside of assert() statements
-@@ -2069,6 +2125,13 @@ static int decodeFlags(MemPage *pPage, int flagByte){
+@@ -1654,6 +1828,9 @@ static int defragmentPage(MemPage *pPage, int nMaxFrag){
+   int iCellStart;            /* First cell offset in input */
+ 
+   assert( sqlite3PagerIswriteable(pPage->pDbPage) );
++  if( pPage->aData[pPage->hdrOffset]==PTF_FSS_LEAF ){
++    return SQLITE_OK;
++  }
+   assert( pPage->pBt!=0 );
+   assert( pPage->pBt->usableSize <= SQLITE_MAX_PAGE_SIZE );
+   assert( pPage->nOverflow==0 );
+@@ -2069,6 +2246,13 @@ static int decodeFlags(MemPage *pPage, int flagByte){
        pPage->intKey = 1;
        pPage->maxLocal = pBt->maxLeaf;
        pPage->minLocal = pBt->minLeaf;
-+    }else if( flagByte==PTF_FSS_LEAF && (pBt->db!=0 && (pBt->db->flags & SQLITE_FixedSchema)!=0) ){
++    }else if( flagByte==PTF_FSS_LEAF ){
 +      pPage->intKeyLeaf = 1;
 +      pPage->xCellSize = fssCellSizePtr;
 +      pPage->xParseCell = btreeParseCellPtrFss;
@@ -91,24 +240,293 @@ index 8b730508c..2baea8f17 100644
      }else if( flagByte==(PTF_ZERODATA | PTF_LEAF) ){
        pPage->intKey = 0;
        pPage->intKeyLeaf = 0;
-@@ -2272,8 +2335,13 @@ static int btreeInitPage(MemPage *pPage){
+@@ -2137,6 +2321,16 @@ static int btreeComputeFreeSpace(MemPage *pPage){
+   usableSize = pPage->pBt->usableSize;
+   hdr = pPage->hdrOffset;
+   data = pPage->aData;
++  if( data[hdr]==PTF_FSS_LEAF ){
++    u16 dataAreaOffset = get2byte(&data[hdr+FSS_HDR_DATA_AREA_OFFSET]);
++    u16 rowPayloadSize = get2byte(&data[hdr+FSS_HDR_ROW_PAYLOAD_SIZE]);
++    int used = hdr + dataAreaOffset + pPage->nCell * rowPayloadSize;
++    if( used > usableSize ){
++      return SQLITE_CORRUPT_PAGE(pPage);
++    }
++    pPage->nFree = (u16)(usableSize - used);
++    return SQLITE_OK;
++  }
+   /* EVIDENCE-OF: R-58015-48175 The two-byte integer at offset 5 designates
+   ** the start of the cell content area. A zero value for this integer is
+   ** interpreted as 65536. */
+@@ -2216,6 +2410,16 @@ static SQLITE_NOINLINE int btreeCellSizeCheck(MemPage *pPage){
+ 
+   iCellFirst = pPage->cellOffset + 2*pPage->nCell;
+   usableSize = pPage->pBt->usableSize;
++  if( pPage->aData[pPage->hdrOffset]==PTF_FSS_LEAF ){
++    u8 *hdrData = &pPage->aData[pPage->hdrOffset];
++    u16 dataAreaOffset = get2byte(&hdrData[FSS_HDR_DATA_AREA_OFFSET]);
++    u16 rowPayloadSize = get2byte(&hdrData[FSS_HDR_ROW_PAYLOAD_SIZE]);
++    int used = pPage->hdrOffset + dataAreaOffset + pPage->nCell * rowPayloadSize;
++    if( used > usableSize ){
++      return SQLITE_CORRUPT_PAGE(pPage);
++    }
++    return SQLITE_OK;
++  }
+   iCellLast = usableSize - 4;
+   data = pPage->aData;
+   cellOffset = pPage->cellOffset;
+@@ -2236,6 +2440,136 @@ static SQLITE_NOINLINE int btreeCellSizeCheck(MemPage *pPage){
+   return SQLITE_OK;
+ }
+ 
++static int btreeValidateFssPage(MemPage *pPage){
++  u8 *pHdr = pPage->aData + pPage->hdrOffset;
++  u8 flags;
++  u16 schema_version, cell_count, capacity, row_payload_size;
++  u16 field_desc_offset, data_area_offset, reserved;
++  u16 nCols, descSize, calcPayloadSize, nullBytes;
++  u32 available, unitSize, expectedCapacity, expectedDataOffset;
++  u8 *pDesc;
++  u16 i;
++
++  if( pHdr[FSS_HDR_PAGE_TYPE] != PTF_FSS_LEAF ){
++    return SQLITE_CORRUPT_PAGE(pPage);
++  }
++  flags = pHdr[FSS_HDR_FLAGS];
++  if( (flags & ~(FSS_FLAG_DENSE_ROWID | FSS_FLAG_NULLABLE)) != 0 ){
++    return SQLITE_CORRUPT_PAGE(pPage);
++  }
++  schema_version = get2byte(&pHdr[FSS_HDR_SCHEMA_VERSION]);
++  if( schema_version != FSS_SCHEMA_VERSION ){
++    return SQLITE_CORRUPT_PAGE(pPage);
++  }
++  cell_count = get2byte(&pHdr[FSS_HDR_CELL_COUNT]);
++  capacity = get2byte(&pHdr[FSS_HDR_CAPACITY]);
++  if( cell_count == 0 || capacity == 0 || cell_count > capacity ){
++    return SQLITE_CORRUPT_PAGE(pPage);
++  }
++  row_payload_size = get2byte(&pHdr[FSS_HDR_ROW_PAYLOAD_SIZE]);
++  if( row_payload_size == 0 ){
++    return SQLITE_CORRUPT_PAGE(pPage);
++  }
++  field_desc_offset = get2byte(&pHdr[FSS_HDR_FIELD_DESC_OFFSET]);
++  if( field_desc_offset != FSS_HEADER_SIZE ){
++    return SQLITE_CORRUPT_PAGE(pPage);
++  }
++  data_area_offset = get2byte(&pHdr[FSS_HDR_DATA_AREA_OFFSET]);
++  reserved = get2byte(&pHdr[FSS_HDR_RESERVED]);
++  if( reserved != 0 ){
++    return SQLITE_CORRUPT_PAGE(pPage);
++  }
++
++  /* Validate Schema Descriptors */
++  if( (u32)field_desc_offset + FSS_SCHEMA_HEADER_SIZE > (u32)(pPage->pBt->usableSize - pPage->hdrOffset) ){
++    return SQLITE_CORRUPT_PAGE(pPage);
++  }
++  pDesc = pHdr + field_desc_offset;
++  nCols = get2byte(&pDesc[FSS_SCHEMA_NUM_COLUMNS]);
++  if( nCols == 0 || nCols > FSS_MAX_COLUMNS ){
++    return SQLITE_CORRUPT_PAGE(pPage);
++  }
++  descSize = FSS_SCHEMA_HEADER_SIZE + nCols * FSS_FIELD_DESC_SIZE;
++  if( (u32)field_desc_offset + descSize > (u32)(pPage->pBt->usableSize - pPage->hdrOffset) ){
++    return SQLITE_CORRUPT_PAGE(pPage);
++  }
++
++  calcPayloadSize = 0;
++  nullBytes = (flags & FSS_FLAG_NULLABLE) ? ((nCols + 7) / 8) : 0;
++  calcPayloadSize += nullBytes;
++  for( i = 0; i < nCols; i++ ){
++    u8 type_id = pDesc[FSS_SCHEMA_COLUMNS + i * FSS_FIELD_DESC_SIZE];
++    u8 col_flags = pDesc[FSS_SCHEMA_COLUMNS + i * FSS_FIELD_DESC_SIZE + 1];
++    u16 width = get2byte(&pDesc[FSS_SCHEMA_COLUMNS + i * FSS_FIELD_DESC_SIZE + 2]);
++    if( (col_flags & ~(FSS_COL_FLAG_NOT_NULL | FSS_COL_FLAG_PRIMARY_KEY)) != 0 ){
++      return SQLITE_CORRUPT_PAGE(pPage);
++    }
++    switch( type_id ){
++      case FSS_TYPE_INT8:        if( width != 1 ) return SQLITE_CORRUPT_PAGE(pPage); break;
++      case FSS_TYPE_INT16:       if( width != 2 ) return SQLITE_CORRUPT_PAGE(pPage); break;
++      case FSS_TYPE_INT32:       if( width != 4 ) return SQLITE_CORRUPT_PAGE(pPage); break;
++      case FSS_TYPE_INT64:       if( width != 8 ) return SQLITE_CORRUPT_PAGE(pPage); break;
++      case FSS_TYPE_FLOAT32:     if( width != 4 ) return SQLITE_CORRUPT_PAGE(pPage); break;
++      case FSS_TYPE_FLOAT64:     if( width != 8 ) return SQLITE_CORRUPT_PAGE(pPage); break;
++      case FSS_TYPE_FIXED_BLOB:  if( width == 0 ) return SQLITE_CORRUPT_PAGE(pPage); break;
++      case FSS_TYPE_TIMESTAMP_US:if( width != 8 ) return SQLITE_CORRUPT_PAGE(pPage); break;
++      default: return SQLITE_CORRUPT_PAGE(pPage);
++    }
++    calcPayloadSize += width;
++  }
++  if( calcPayloadSize != row_payload_size ){
++    return SQLITE_CORRUPT_PAGE(pPage);
++  }
++
++  /* Validate Capacity & Offsets */
++  available = pPage->pBt->usableSize - pPage->hdrOffset - FSS_HEADER_SIZE - descSize;
++  if( flags & FSS_FLAG_DENSE_ROWID ){
++    if( available < 8 ) return SQLITE_CORRUPT_PAGE(pPage);
++    available -= 8;
++    unitSize = row_payload_size;
++  }else{
++    unitSize = row_payload_size + 8;
++  }
++  if( unitSize == 0 ) return SQLITE_CORRUPT_PAGE(pPage);
++  expectedCapacity = available / unitSize;
++  if( expectedCapacity > UINT16_MAX ) expectedCapacity = UINT16_MAX;
++  if( expectedCapacity == 0 || (u16)expectedCapacity != capacity ){
++    return SQLITE_CORRUPT_PAGE(pPage);
++  }
++
++  expectedDataOffset = FSS_HEADER_SIZE + descSize + ((flags & FSS_FLAG_DENSE_ROWID) ? 8 : (8 * capacity));
++  if( expectedDataOffset > UINT16_MAX || (u16)expectedDataOffset != data_area_offset ){
++    return SQLITE_CORRUPT_PAGE(pPage);
++  }
++  if( (u32)pPage->hdrOffset + data_area_offset + (u32)cell_count * row_payload_size > (u32)pPage->pBt->usableSize ){
++    return SQLITE_CORRUPT_PAGE(pPage);
++  }
++
++  /* Validate Rowids */
++  if( flags & FSS_FLAG_DENSE_ROWID ){
++    i64 minRowid = fssGetRowid(pPage, 0);
++    if( minRowid > INT64_MAX - (i64)(cell_count - 1) ){
++      return SQLITE_CORRUPT_PAGE(pPage);
++    }
++  }else{
++    i64 prev = fssGetRowid(pPage, 0);
++    for( i = 1; i < cell_count; i++ ){
++      i64 curr = fssGetRowid(pPage, i);
++      if( curr <= prev ){
++        return SQLITE_CORRUPT_PAGE(pPage);
++      }
++      prev = curr;
++    }
++    for( i = cell_count; i < capacity; i++ ){
++      if( fssGetRowid(pPage, i) != 0 ){
++        return SQLITE_CORRUPT_PAGE(pPage);
++      }
++    }
++  }
++
++  return SQLITE_OK;
++}
++
+ /*
+ ** Initialize the auxiliary information for a disk block.
+ **
+@@ -2272,11 +2606,21 @@ static int btreeInitPage(MemPage *pPage){
    pPage->aDataEnd = pPage->aData + pBt->pageSize;
    pPage->aDataOfst = pPage->aData + pPage->childPtrSize;
    /* EVIDENCE-OF: R-37002-32774 The two-byte integer at offset 3 gives the
 -  ** number of cells on the page. */
 -  pPage->nCell = get2byte(&data[3]);
+-  if( pPage->nCell>MX_CELL(pBt) ){
+-    /* To many cells for a single page.  The page must be corrupt */
+-    return SQLITE_CORRUPT_PAGE(pPage);
 +  ** number of cells on the page. In FSS pages (0x0E), cell_count is at offset 4. */
-+  if( data[0]==PTF_FSS_LEAF && (pBt->db!=0 && (pBt->db->flags & SQLITE_FixedSchema)!=0) ){
++  if( data[0]==PTF_FSS_LEAF ){
 +    pPage->nCell = get2byte(&data[4]);
++    if( pPage->nCell==0 || pPage->nCell>MX_CELL(pBt) ){
++      return SQLITE_CORRUPT_PAGE(pPage);
++    }
++    if( btreeValidateFssPage(pPage)!=SQLITE_OK ){
++      return SQLITE_CORRUPT_PAGE(pPage);
++    }
 +  }else{
 +    pPage->nCell = get2byte(&data[3]);
-+  }
-+
-   if( pPage->nCell>MX_CELL(pBt) ){
-     /* To many cells for a single page.  The page must be corrupt */
-     return SQLITE_CORRUPT_PAGE(pPage);
-@@ -5920,15 +5988,19 @@ int sqlite3BtreeTableMoveto(
++    if( pPage->nCell>MX_CELL(pBt) ){
++      /* To many cells for a single page.  The page must be corrupt */
++      return SQLITE_CORRUPT_PAGE(pPage);
++    }
+   }
+   testcase( pPage->nCell==MX_CELL(pBt) );
+   /* EVIDENCE-OF: R-24089-57979 If a page contains no cells (which is only
+@@ -3452,6 +3796,40 @@ static int lockBtree(BtShared *pBt){
+ #ifndef SQLITE_OMIT_AUTOVACUUM
+     pBt->autoVacuum = (get4byte(&page1[36 + 4*4])?1:0);
+     pBt->incrVacuum = (get4byte(&page1[36 + 7*4])?1:0);
++#endif
++#ifndef SQLITE_OMIT_FSS
++    {
++      u32 fssVersion = 0;
++      int markerRc = sqlite3FssValidateDbMarker(page1, &fssVersion);
++      if( markerRc == FSS_MARKER_VALID ){
++        pBt->btsFlags |= BTS_FSS;
++      }else if( markerRc == FSS_MARKER_NONE ){
++        pBt->btsFlags &= ~BTS_FSS;
++      }else if( markerRc == FSS_MARKER_UNSUPPORTED_VER ){
++        if( pBt->db ){
++          sqlite3ErrorWithMsg(pBt->db, SQLITE_NOTADB,
++            "unsupported FSS database format version %u", (unsigned)fssVersion);
++        }
++        rc = SQLITE_NOTADB;
++        goto page1_init_failed;
++      }else{ /* FSS_MARKER_INVALID */
++        if( pBt->db ){
++          sqlite3ErrorWithMsg(pBt->db, SQLITE_NOTADB,
++            "unknown or invalid FSS database marker");
++        }
++        rc = SQLITE_NOTADB;
++        goto page1_init_failed;
++      }
++    }
++#else
++    if( memcmp(&page1[FSS_DB_MARKER_OFFSET], FSS_DB_MAGIC, FSS_DB_MAGIC_SIZE)==0 ){
++      if( pBt->db ){
++        sqlite3ErrorWithMsg(pBt->db, SQLITE_NOTADB,
++          "FSS database format is not supported by this build");
++      }
++      rc = SQLITE_NOTADB;
++      goto page1_init_failed;
++    }
+ #endif
+   }
+ 
+@@ -4584,6 +4962,16 @@ int sqlite3BtreeRollback(Btree *p, int tripCode, int writeOnly){
+     ** sure pPage1->aData is set correctly. */
+     if( btreeGetPage(pBt, 1, &pPage1, 0)==SQLITE_OK ){
+       btreeSetNPage(pBt, pPage1);
++#ifndef SQLITE_OMIT_FSS
++      if( pBt->pPage1 && pBt->pPage1->aData ){
++        u32 fssVer = 0;
++        if( sqlite3FssValidateDbMarker(pBt->pPage1->aData, &fssVer)==FSS_MARKER_VALID ){
++          pBt->btsFlags |= BTS_FSS;
++        }else{
++          pBt->btsFlags &= ~BTS_FSS;
++        }
++      }
++#endif
+       releasePageOne(pPage1);
+     }
+     assert( countValidCursors(pBt, 1)==0 );
+@@ -5918,17 +6306,48 @@ int sqlite3BtreeTableMoveto(
+     upr = pPage->nCell-1;
+     assert( biasRight==0 || biasRight==1 );
      idx = upr>>(1-biasRight); /* idx = biasRight ? upr : (lwr+upr)/2; */
++    if( pPage->aData[pPage->hdrOffset] == PTF_FSS_LEAF ){
++      u8 fssFlags = pPage->aData[pPage->hdrOffset + FSS_HDR_FLAGS];
++      if( fssFlags & FSS_FLAG_DENSE_ROWID ){
++        i64 minRowid = fssGetRowid(pPage, 0);
++        i64 maxRowid = minRowid + (pPage->nCell - 1);
++        if( intKey < minRowid ){
++          idx = 0;
++          c = +1;
++        }else if( intKey > maxRowid ){
++          idx = pPage->nCell - 1;
++          c = -1;
++        }else{
++          idx = (int)(intKey - minRowid);
++          pCur->ix = (u16)idx;
++          pCur->curFlags |= BTCF_ValidNKey;
++          pCur->info.nKey = intKey;
++          pCur->info.nSize = 0;
++          *pRes = 0;
++          return SQLITE_OK;
++        }
++        assert( pPage->leaf );
++        pCur->ix = (u16)idx;
++        *pRes = c;
++        rc = SQLITE_OK;
++        goto moveto_table_finish;
++      }
++    }
      for(;;){
        i64 nCellKey;
 -      pCell = findCellPastPtr(pPage, idx);
@@ -133,11 +551,1148 @@ index 8b730508c..2baea8f17 100644
        if( nCellKey<intKey ){
          lwr = idx+1;
          if( lwr>upr ){ c = -1; break; }
+@@ -8036,6 +8455,97 @@ static int editPage(
+ ** words, at most 13 bytes. Hence the pSpace buffer must be at
+ ** least 13 bytes in size.
+ */
++#ifndef SQLITE_OMIT_FSS
++static int balance_quick_fss(MemPage *pParent, MemPage *pPage, u8 *pSpace){
++  BtShared *const pBt = pPage->pBt;
++  MemPage *pNew = 0;
++  Pgno pgnoNew;
++  int rc;
++  FssPage fssPage;
++  u16 descSize, cap, dataOffset, flags, rsz, nCols;
++  u8 *pOut;
++  i64 maxKey;
++  i64 ovflRowid;
++  u8 *pSlot;
++
++  assert( sqlite3_mutex_held(pBt->mutex) );
++  assert( sqlite3PagerIswriteable(pParent->pDbPage) );
++  assert( pPage->nOverflow==1 );
++
++  rc = allocateBtreePage(pBt, &pNew, &pgnoNew, 0, 0);
++  if( rc!=SQLITE_OK ) return rc;
++
++  assert( sqlite3PagerIswriteable(pNew->pDbPage) );
++
++  rc = fssPageParse(pPage->aData, pBt->usableSize, pPage->hdrOffset, &fssPage);
++  if( rc!=FSS_OK ){
++    releasePage(pNew);
++    return SQLITE_CORRUPT_PAGE(pPage);
++  }
++
++  nCols = fssPage.schema.num_columns;
++  rsz = fssPage.hdr.row_payload_size;
++  descSize = FSS_SCHEMA_HEADER_SIZE + nCols * FSS_FIELD_DESC_SIZE;
++  flags = (fssPage.hdr.flags & FSS_FLAG_NULLABLE) | FSS_FLAG_DENSE_ROWID;
++  cap = fssCalculateCapacity(pBt->usableSize, pNew->hdrOffset, nCols, rsz, flags);
++  dataOffset = FSS_HEADER_SIZE + descSize + 8;
++
++  ovflRowid = (i64)fssGetI64(pPage->apOvfl[0]);
++  pSlot = pPage->apOvfl[0] + 8;
++
++  pNew->aData[pNew->hdrOffset + FSS_HDR_PAGE_TYPE] = PTF_FSS_LEAF;
++  pNew->aData[pNew->hdrOffset + FSS_HDR_FLAGS] = flags;
++  put2byte(&pNew->aData[pNew->hdrOffset + FSS_HDR_SCHEMA_VERSION], FSS_SCHEMA_VERSION);
++  put2byte(&pNew->aData[pNew->hdrOffset + FSS_HDR_CELL_COUNT], 1);
++  put2byte(&pNew->aData[pNew->hdrOffset + FSS_HDR_CAPACITY], cap);
++  put2byte(&pNew->aData[pNew->hdrOffset + FSS_HDR_ROW_PAYLOAD_SIZE], rsz);
++  put2byte(&pNew->aData[pNew->hdrOffset + FSS_HDR_FIELD_DESC_OFFSET], FSS_HEADER_SIZE);
++  put2byte(&pNew->aData[pNew->hdrOffset + FSS_HDR_DATA_AREA_OFFSET], dataOffset);
++  put2byte(&pNew->aData[pNew->hdrOffset + FSS_HDR_RESERVED], 0);
++
++  memcpy(&pNew->aData[pNew->hdrOffset + FSS_HEADER_SIZE],
++         &pPage->aData[pPage->hdrOffset + fssPage.hdr.field_desc_offset],
++         descSize);
++
++  fssPutI64(&pNew->aData[pNew->hdrOffset + FSS_HEADER_SIZE + descSize], ovflRowid);
++  memcpy(&pNew->aData[pNew->hdrOffset + dataOffset], pSlot, rsz);
++
++  if( (u32)pNew->hdrOffset + dataOffset + rsz < pBt->usableSize ){
++    memset(&pNew->aData[pNew->hdrOffset + dataOffset + rsz], 0,
++           pBt->usableSize - (pNew->hdrOffset + dataOffset + rsz));
++  }
++
++  pNew->isInit = 0;
++  pNew->nOverflow = 0;
++  rc = btreeInitPage(pNew);
++  if( rc==SQLITE_OK ) rc = btreeComputeFreeSpace(pNew);
++  if( rc!=SQLITE_OK ){
++    releasePage(pNew);
++    return rc;
++  }
++
++  if( ISAUTOVACUUM(pBt) ){
++    ptrmapPut(pBt, pgnoNew, PTRMAP_BTREE, pParent->pgno, &rc);
++    if( rc!=SQLITE_OK ){
++      releasePage(pNew);
++      return rc;
++    }
++  }
++
++  maxKey = fssGetRowid(pPage, pPage->nCell - 1);
++  pOut = &pSpace[4];
++  pOut += sqlite3PutVarint(pOut, maxKey);
++  put4byte(pSpace, pPage->pgno);
++
++  rc = insertCell(pParent, pParent->nCell, pSpace, (int)(pOut - pSpace), 0, pPage->pgno);
++  put4byte(&pParent->aData[pParent->hdrOffset + 8], pgnoNew);
++
++  pPage->nOverflow = 0;
++  releasePage(pNew);
++  return rc;
++}
++#endif
++
+ static int balance_quick(MemPage *pParent, MemPage *pPage, u8 *pSpace){
+   BtShared *const pBt = pPage->pBt;    /* B-Tree Database */
+   MemPage *pNew;                       /* Newly allocated page */
+@@ -8046,6 +8556,12 @@ static int balance_quick(MemPage *pParent, MemPage *pPage, u8 *pSpace){
+   assert( sqlite3PagerIswriteable(pParent->pDbPage) );
+   assert( pPage->nOverflow==1 );
+  
++#ifndef SQLITE_OMIT_FSS
++  if( pPage->aData[pPage->hdrOffset]==PTF_FSS_LEAF ){
++    return balance_quick_fss(pParent, pPage, pSpace);
++  }
++#endif
++ 
+   if( pPage->nCell==0 ) return SQLITE_CORRUPT_BKPT;  /* dbfuzz001.test */
+   assert( pPage->nFree>=0 );
+   assert( pParent->nFree>=0 );
+@@ -8192,8 +8708,83 @@ static int ptrmapCheckPages(MemPage **apPage, int nPage){
+ ** the balance_shallower() and balance_deeper() procedures, neither of
+ ** which are called often under normal circumstances.
+ */
++#ifndef SQLITE_OMIT_FSS
++static void copyFssNodeContent(MemPage *pFrom, MemPage *pTo, int *pRC){
++  BtShared * const pBt = pFrom->pBt;
++  u8 * const aFrom = pFrom->aData;
++  u8 * const aTo = pTo->aData;
++  int const iFromHdr = pFrom->hdrOffset;
++  int const iToHdr = ((pTo->pgno==1) ? 100 : 0);
++  int rc;
++  FssPage fssFrom;
++  u16 nCols, descSize, rsz, cap, dataOffset;
++  u8 flags;
++
++  assert( pFrom->isInit );
++  rc = fssPageParse(aFrom, pBt->usableSize, iFromHdr, &fssFrom);
++  if( rc != FSS_OK ){
++    *pRC = SQLITE_CORRUPT_PAGE(pFrom);
++    return;
++  }
++  nCols = fssFrom.schema.num_columns;
++  descSize = FSS_SCHEMA_HEADER_SIZE + nCols * FSS_FIELD_DESC_SIZE;
++  flags = fssFrom.hdr.flags;
++  rsz = fssFrom.hdr.row_payload_size;
++  cap = fssCalculateCapacity(pBt->usableSize, iToHdr, nCols, rsz, flags);
++  if( cap < fssFrom.hdr.cell_count ){
++    *pRC = SQLITE_CORRUPT_PAGE(pFrom);
++    return;
++  }
++  dataOffset = FSS_HEADER_SIZE + descSize + ((flags & FSS_FLAG_DENSE_ROWID) ? 8 : (8 * cap));
++
++  /* Write FSS header on pTo */
++  aTo[iToHdr + FSS_HDR_PAGE_TYPE] = PTF_FSS_LEAF;
++  aTo[iToHdr + FSS_HDR_FLAGS] = flags;
++  put2byte(&aTo[iToHdr + FSS_HDR_SCHEMA_VERSION], FSS_SCHEMA_VERSION);
++  put2byte(&aTo[iToHdr + FSS_HDR_CELL_COUNT], fssFrom.hdr.cell_count);
++  put2byte(&aTo[iToHdr + FSS_HDR_CAPACITY], cap);
++  put2byte(&aTo[iToHdr + FSS_HDR_ROW_PAYLOAD_SIZE], rsz);
++  put2byte(&aTo[iToHdr + FSS_HDR_FIELD_DESC_OFFSET], FSS_HEADER_SIZE);
++  put2byte(&aTo[iToHdr + FSS_HDR_DATA_AREA_OFFSET], dataOffset);
++  put2byte(&aTo[iToHdr + FSS_HDR_RESERVED], 0);
++
++  /* Copy schema descriptors */
++  memcpy(&aTo[iToHdr + FSS_HEADER_SIZE],
++         &aFrom[iFromHdr + fssFrom.hdr.field_desc_offset],
++         descSize);
++
++  /* Copy rowids */
++  if( flags & FSS_FLAG_DENSE_ROWID ){
++    memcpy(&aTo[iToHdr + FSS_HEADER_SIZE + descSize], fssFrom.aRowIndex, 8);
++  }else{
++    memset(&aTo[iToHdr + FSS_HEADER_SIZE + descSize], 0, 8 * cap);
++    memcpy(&aTo[iToHdr + FSS_HEADER_SIZE + descSize], fssFrom.aRowIndex, 8 * fssFrom.hdr.cell_count);
++  }
++
++  /* Copy data slots */
++  memcpy(&aTo[iToHdr + dataOffset], fssFrom.aDataArea, (size_t)fssFrom.hdr.cell_count * rsz);
++
++  /* Zero the rest of usable page space */
++  if( (u32)iToHdr + dataOffset + (u32)fssFrom.hdr.cell_count * rsz < pBt->usableSize ){
++    memset(&aTo[iToHdr + dataOffset + fssFrom.hdr.cell_count * rsz], 0,
++           pBt->usableSize - (iToHdr + dataOffset + fssFrom.hdr.cell_count * rsz));
++  }
++
++  pTo->isInit = 0;
++  rc = btreeInitPage(pTo);
++  if( rc==SQLITE_OK ) rc = btreeComputeFreeSpace(pTo);
++  *pRC = rc;
++}
++#endif
++
+ static void copyNodeContent(MemPage *pFrom, MemPage *pTo, int *pRC){
+   if( (*pRC)==SQLITE_OK ){
++#ifndef SQLITE_OMIT_FSS
++    if( pFrom->aData[pFrom->hdrOffset]==PTF_FSS_LEAF ){
++      copyFssNodeContent(pFrom, pTo, pRC);
++      return;
++    }
++#endif
+     BtShared * const pBt = pFrom->pBt;
+     u8 * const aFrom = pFrom->aData;
+     u8 * const aTo = pTo->aData;
+@@ -8274,25 +8865,347 @@ static void copyNodeContent(MemPage *pFrom, MemPage *pTo, int *pRC){
+ ** If aOvflSpace is set to a null pointer, this function returns
+ ** SQLITE_NOMEM.
+ */
+-static int balance_nonroot(
++#ifndef SQLITE_OMIT_FSS
++typedef struct FssBalRow {
++  i64 rowid;
++  u8 *pData;
++} FssBalRow;
++
++static int balance_nonroot_fss(
+   MemPage *pParent,               /* Parent page of siblings being balanced */
+   int iParentIdx,                 /* Index of "the page" in pParent */
+   u8 *aOvflSpace,                 /* page-size bytes of space for parent ovfl */
+   int isRoot,                     /* True if pParent is a root-page */
+-  int bBulk                       /* True if this call is part of a bulk load */
++  int bBulk,                      /* True if this call is part of a bulk load */
++  MemPage **apOld,                /* Old sibling pages (nOld pages) */
++  int nOld,                       /* Number of old sibling pages (1..3) */
++  u8 **apDiv,                     /* Divider cells in pParent (nOld-1 cells) */
++  int nxDiv,                      /* Next divider slot in pParent->aCell[] */
++  u8 *pRight                      /* Location in parent of right-sibling pointer */
+ ){
+-  BtShared *pBt;               /* The whole database */
+-  int nMaxCells = 0;           /* Allocated size of apCell, szCell, aFrom. */
+-  int nNew = 0;                /* Number of pages in apNew[] */
+-  int nOld;                    /* Number of pages in apOld[] */
+-  int i, j, k;                 /* Loop counters */
+-  int nxDiv;                   /* Next divider slot in pParent->aCell[] */
+-  int rc = SQLITE_OK;          /* The return code */
+-  u16 leafCorrection;          /* 4 if pPage is a leaf.  0 if not */
+-  int leafData;                /* True if pPage is a leaf of a LEAFDATA tree */
+-  int usableSpace;             /* Bytes in pPage beyond the header */
+-  int pageFlags;               /* Value of pPage->aData[0] */
+-  int iSpace1 = 0;             /* First unused byte of aSpace1[] */
++  BtShared *pBt = pParent->pBt;
++  int rc = SQLITE_OK;
++  int i, j, k, m;
++  int totalRows = 0;
++  FssBalRow *aRows = 0;
++  u8 *pRowBuffer = 0;
++  MemPage *apNew[NB+2];
++  int nNew = 0;
++  FssPage fssFirst;
++  u16 nCols, descSize, rsz;
++  u8 fssFlags;
++  u16 capSparse;
++  u8 aDescBuf[FSS_HEADER_SIZE + FSS_MAX_COLUMNS * FSS_FIELD_DESC_SIZE];
++  int startIdx, base, rem;
++  int maxRows = 0;
++
++  UNUSED_PARAMETER(iParentIdx);
++  UNUSED_PARAMETER(aOvflSpace);
++  UNUSED_PARAMETER(apDiv);
++
++  assert( sqlite3_mutex_held(pBt->mutex) );
++  assert( sqlite3PagerIswriteable(pParent->pDbPage) );
++
++  MemPage *pSrcSchema = 0;
++  for( i=0; i<nOld; i++ ){
++    if( apOld[i]->aData[apOld[i]->hdrOffset]==PTF_FSS_LEAF && apOld[i]->nCell>0 ){
++      pSrcSchema = apOld[i];
++      break;
++    }
++  }
++  if( pSrcSchema==0 ) pSrcSchema = apOld[0];
++
++  rc = fssPageParse(pSrcSchema->aData, pBt->usableSize, pSrcSchema->hdrOffset, &fssFirst);
++  if( rc!=FSS_OK ){
++    return SQLITE_CORRUPT_PAGE(pSrcSchema);
++  }
++  nCols = fssFirst.schema.num_columns;
++  descSize = FSS_SCHEMA_HEADER_SIZE + nCols * FSS_FIELD_DESC_SIZE;
++  rsz = fssFirst.hdr.row_payload_size;
++  fssFlags = fssFirst.hdr.flags;
++
++  if( descSize > sizeof(aDescBuf) ){
++    return SQLITE_CORRUPT_PAGE(pSrcSchema);
++  }
++  memcpy(aDescBuf,
++         pSrcSchema->aData + pSrcSchema->hdrOffset + fssFirst.hdr.field_desc_offset,
++         descSize);
++
++  for( i=0; i<nOld; i++ ){
++    maxRows += apOld[i]->nCell + apOld[i]->nOverflow;
++  }
++  aRows = sqlite3DbMallocRaw(pBt->db, sizeof(FssBalRow) * (maxRows + 1));
++  if( aRows==0 ) return SQLITE_NOMEM_BKPT;
++
++  pRowBuffer = sqlite3DbMallocRaw(pBt->db, (size_t)(maxRows + 1) * rsz);
++  if( pRowBuffer==0 ){
++    sqlite3DbFree(pBt->db, aRows);
++    return SQLITE_NOMEM_BKPT;
++  }
++
++  for( i=0; i<nOld; i++ ){
++    MemPage *pOld = apOld[i];
++    int limit = pOld->nCell;
++    int ovflIdx = (pOld->nOverflow > 0) ? (int)pOld->aiOvfl[0] : -1;
++    int skipIdx = (pOld->nOverflow==1 && pOld->apOvfl[0]==(u8*)1) ? (int)pOld->aiOvfl[0] : -1;
++
++    for( j=0; j<limit; j++ ){
++      if( j==skipIdx ) continue;
++      if( j==ovflIdx && skipIdx<0 ){
++        for( k=0; k<pOld->nOverflow; k++ ){
++          aRows[totalRows].rowid = (i64)fssGetI64(pOld->apOvfl[k]);
++          aRows[totalRows].pData = pRowBuffer + (size_t)totalRows * rsz;
++          memcpy(aRows[totalRows].pData, pOld->apOvfl[k] + 8, rsz);
++          totalRows++;
++        }
++      }
++      if( pOld->aData[pOld->hdrOffset]==PTF_FSS_LEAF ){
++        aRows[totalRows].rowid = fssGetRowid(pOld, j);
++        aRows[totalRows].pData = pRowBuffer + (size_t)totalRows * rsz;
++        memcpy(aRows[totalRows].pData, fssFindCell(pOld, j), rsz);
++        totalRows++;
++      }else{
++        u8 *pCell = findCell(pOld, j);
++        CellInfo info;
++        FssValue aVals[FSS_MAX_COLUMNS];
++        uint16_t nVals = 0;
++        pOld->xParseCell(pOld, pCell, &info);
++        if( fssRecordToValues(info.pPayload, info.nPayload, aVals, FSS_MAX_COLUMNS, &nVals)==FSS_OK ){
++          aRows[totalRows].rowid = info.nKey;
++          aRows[totalRows].pData = pRowBuffer + (size_t)totalRows * rsz;
++          fssWriteSlot(aRows[totalRows].pData, &fssFirst.schema, fssFlags, aVals);
++          totalRows++;
++        }
++      }
++    }
++    if( limit==ovflIdx && skipIdx<0 ){
++      for( k=0; k<pOld->nOverflow; k++ ){
++        aRows[totalRows].rowid = (i64)fssGetI64(pOld->apOvfl[k]);
++        aRows[totalRows].pData = pRowBuffer + (size_t)totalRows * rsz;
++        memcpy(aRows[totalRows].pData, pOld->apOvfl[k] + 8, rsz);
++        totalRows++;
++      }
++    }
++    pOld->nOverflow = 0;
++  }
++
++  capSparse = fssCalculateCapacity(pBt->usableSize, 0, nCols, rsz, fssFlags & ~FSS_FLAG_DENSE_ROWID);
++  if( capSparse==0 ){
++    rc = SQLITE_CORRUPT_BKPT;
++    goto cleanup_fss;
++  }
++
++  if( totalRows==0 ){
++    zeroPage(apOld[0], PTF_INTKEY | PTF_LEAFDATA | PTF_LEAF);
++    apNew[0] = apOld[0];
++    apOld[0] = 0;
++    nNew = 1;
++    for( i=1; i<nOld; i++ ){
++      if( apOld[i] ){
++        freePage(apOld[i], &rc);
++        releasePage(apOld[i]);
++        apOld[i] = 0;
++      }
++    }
++    if( isRoot && pParent->nCell==0 ){
++      copyNodeContent(apNew[0], pParent, &rc);
++      freePage(apNew[0], &rc);
++    }
++    goto cleanup_fss;
++  }
++
++  k = (totalRows + capSparse - 1) / capSparse;
++  if( k < 1 ) k = 1;
++  if( !bBulk && k < nOld ){
++    /* Merge */
++  }else if( k < nOld ){
++    k = nOld;
++  }
++  if( k > NB + 2 ){
++    rc = SQLITE_CORRUPT_BKPT;
++    goto cleanup_fss;
++  }
++
++  memset(apNew, 0, sizeof(apNew));
++  for( i=0; i<k; i++ ){
++    MemPage *pNew;
++    if( i<nOld ){
++      pNew = apNew[i] = apOld[i];
++      apOld[i] = 0;
++      rc = sqlite3PagerWrite(pNew->pDbPage);
++      if( rc ) goto cleanup_fss;
++      nNew++;
++    }else{
++      Pgno pgno = 0;
++      rc = allocateBtreePage(pBt, &pNew, &pgno, (bBulk ? 1 : pgno), 0);
++      if( rc ) goto cleanup_fss;
++      apNew[i] = pNew;
++      nNew++;
++      if( ISAUTOVACUUM(pBt) ){
++        ptrmapPut(pBt, pNew->pgno, PTRMAP_BTREE, pParent->pgno, &rc);
++        if( rc ) goto cleanup_fss;
++      }
++    }
++  }
++
++  for( i=k; i<nOld; i++ ){
++    if( apOld[i] ){
++      freePage(apOld[i], &rc);
++      releasePage(apOld[i]);
++      apOld[i] = 0;
++    }
++  }
++
++
++  for( i=0; i<nNew-1; i++ ){
++    int iB = i;
++    for( j=i+1; j<nNew; j++ ){
++      if( apNew[j]->pgno < apNew[iB]->pgno ) iB = j;
++    }
++    if( iB!=i ){
++      Pgno pgnoA = apNew[i]->pgno;
++      Pgno pgnoB = apNew[iB]->pgno;
++      Pgno pgnoTemp = (PENDING_BYTE/pBt->pageSize)+1;
++      u16 fgA = apNew[i]->pDbPage->flags;
++      u16 fgB = apNew[iB]->pDbPage->flags;
++      sqlite3PagerRekey(apNew[i]->pDbPage, pgnoTemp, fgB);
++      sqlite3PagerRekey(apNew[iB]->pDbPage, pgnoA, fgA);
++      sqlite3PagerRekey(apNew[iB]->pDbPage, pgnoB, fgB);
++      apNew[i]->pgno = pgnoB;
++      apNew[iB]->pgno = pgnoA;
++    }
++  }
++
++  startIdx = 0;
++  base = totalRows / k;
++  rem = totalRows % k;
++
++  for( i=0; i<k; i++ ){
++    int count = base + (i < rem ? 1 : 0);
++    MemPage *pNew = apNew[i];
++    u8 pageFlags;
++    u16 pageCap;
++    u16 dataOffset;
++    int isDense = 1;
++
++    for( m=1; m<count; m++ ){
++      if( aRows[startIdx + m].rowid != aRows[startIdx].rowid + m ){
++        isDense = 0;
++        break;
++      }
++    }
++
++    if( isDense ){
++      pageFlags = (fssFlags & FSS_FLAG_NULLABLE) | FSS_FLAG_DENSE_ROWID;
++      pageCap = fssCalculateCapacity(pBt->usableSize, pNew->hdrOffset, nCols, rsz, pageFlags);
++      dataOffset = FSS_HEADER_SIZE + descSize + 8;
++    }else{
++      pageFlags = (fssFlags & FSS_FLAG_NULLABLE);
++      pageCap = capSparse;
++      dataOffset = FSS_HEADER_SIZE + descSize + 8 * pageCap;
++    }
++
++    pNew->aData[pNew->hdrOffset + FSS_HDR_PAGE_TYPE] = PTF_FSS_LEAF;
++    pNew->aData[pNew->hdrOffset + FSS_HDR_FLAGS] = pageFlags;
++    put2byte(&pNew->aData[pNew->hdrOffset + FSS_HDR_SCHEMA_VERSION], FSS_SCHEMA_VERSION);
++    put2byte(&pNew->aData[pNew->hdrOffset + FSS_HDR_CELL_COUNT], (u16)count);
++    put2byte(&pNew->aData[pNew->hdrOffset + FSS_HDR_CAPACITY], pageCap);
++    put2byte(&pNew->aData[pNew->hdrOffset + FSS_HDR_ROW_PAYLOAD_SIZE], rsz);
++    put2byte(&pNew->aData[pNew->hdrOffset + FSS_HDR_FIELD_DESC_OFFSET], FSS_HEADER_SIZE);
++    put2byte(&pNew->aData[pNew->hdrOffset + FSS_HDR_DATA_AREA_OFFSET], dataOffset);
++    put2byte(&pNew->aData[pNew->hdrOffset + FSS_HDR_RESERVED], 0);
++
++    memcpy(&pNew->aData[pNew->hdrOffset + FSS_HEADER_SIZE], aDescBuf, descSize);
++
++    if( isDense ){
++      fssPutI64(&pNew->aData[pNew->hdrOffset + FSS_HEADER_SIZE + descSize], aRows[startIdx].rowid);
++    }else{
++      memset(&pNew->aData[pNew->hdrOffset + FSS_HEADER_SIZE + descSize], 0, 8 * pageCap);
++      for( m=0; m<count; m++ ){
++        fssPutI64(&pNew->aData[pNew->hdrOffset + FSS_HEADER_SIZE + descSize + 8 * m],
++                  aRows[startIdx + m].rowid);
++      }
++    }
++
++    for( m=0; m<count; m++ ){
++      memcpy(&pNew->aData[pNew->hdrOffset + dataOffset + m * rsz],
++             aRows[startIdx + m].pData, rsz);
++    }
++
++    if( (u32)pNew->hdrOffset + dataOffset + (u32)count * rsz < pBt->usableSize ){
++      memset(&pNew->aData[pNew->hdrOffset + dataOffset + count * rsz], 0,
++             pBt->usableSize - (pNew->hdrOffset + dataOffset + count * rsz));
++    }
++
++    pNew->isInit = 0;
++    pNew->nOverflow = 0;
++    rc = btreeInitPage(pNew);
++    if( rc==SQLITE_OK ) rc = btreeComputeFreeSpace(pNew);
++    if( rc!=SQLITE_OK ) goto cleanup_fss;
++
++    startIdx += count;
++  }
++
++  assert( nNew > 0 );
++  put4byte(pRight, apNew[nNew-1]->pgno);
++
++  startIdx = 0;
++  for( i=0; i<nNew-1; i++ ){
++    int count = base + (i < rem ? 1 : 0);
++    i64 divKey = aRows[startIdx + count - 1].rowid;
++    u8 aDivCell[13];
++    int szKey;
++    int szDiv;
++
++    put4byte(aDivCell, apNew[i]->pgno);
++    szKey = sqlite3PutVarint(&aDivCell[4], divKey);
++    szDiv = 4 + szKey;
++
++    rc = insertCell(pParent, nxDiv + i, aDivCell, szDiv, 0, apNew[i]->pgno);
++    if( rc!=SQLITE_OK ) goto cleanup_fss;
++    startIdx += count;
++  }
++
++  if( isRoot && pParent->nCell==0 && pParent->hdrOffset<=apNew[0]->nFree ){
++    assert( nNew==1 );
++    rc = defragmentPage(apNew[0], -1);
++    copyNodeContent(apNew[0], pParent, &rc);
++    freePage(apNew[0], &rc);
++  }
++
++cleanup_fss:
++  if( pRowBuffer ){
++    sqlite3DbFree(pBt->db, pRowBuffer);
++  }
++  if( aRows ){
++    sqlite3DbFree(pBt->db, aRows);
++  }
++  for( i=0; i<nNew; i++ ){
++    releasePage(apNew[i]);
++  }
++  return rc;
++}
++#endif
++
++static int balance_nonroot(
++  MemPage *pParent,               /* Parent page of siblings being balanced */
++  int iParentIdx,                 /* Index of "the page" in pParent */
++  u8 *aOvflSpace,                 /* page-size bytes of space for parent ovfl */
++  int isRoot,                     /* True if pParent is a root-page */
++  int bBulk                       /* True if this call is part of a bulk load */
++){
++  BtShared *pBt;               /* The whole database */
++  int nMaxCells = 0;           /* Allocated size of apCell, szCell, aFrom. */
++  int nNew = 0;                /* Number of pages in apNew[] */
++  int nOld;                    /* Number of pages in apOld[] */
++  int i, j, k;                 /* Loop counters */
++  int nxDiv;                   /* Next divider slot in pParent->aCell[] */
++  int rc = SQLITE_OK;          /* The return code */
++  u16 leafCorrection;          /* 4 if pPage is a leaf.  0 if not */
++  int leafData;                /* True if pPage is a leaf of a LEAFDATA tree */
++  int usableSpace;             /* Bytes in pPage beyond the header */
++  int pageFlags;               /* Value of pPage->aData[0] */
++  int iSpace1 = 0;             /* First unused byte of aSpace1[] */
+   int iOvflSpace = 0;          /* First unused byte of aOvflSpace[] */
+   u64 szScratch;               /* Size of scratch memory requested */
+   MemPage *apOld[NB];          /* pPage and up to two siblings */
+@@ -8457,6 +9370,13 @@ static int balance_nonroot(
+   b.pRef = apOld[0];
+   leafCorrection = b.pRef->leaf*4;
+   leafData = b.pRef->intKeyLeaf;
++#ifndef SQLITE_OMIT_FSS
++  if( apOld[0]->aData[apOld[0]->hdrOffset]==PTF_FSS_LEAF ){
++    rc = balance_nonroot_fss(pParent, iParentIdx, aOvflSpace, isRoot, bBulk,
++                             apOld, nOld, apDiv, nxDiv, pRight);
++    goto balance_cleanup;
++  }
++#endif
+   for(i=0; i<nOld; i++){
+     MemPage *pOld = apOld[i];
+     int limit = pOld->nCell;
+@@ -9005,7 +9925,8 @@ static int balance_nonroot(
+     assert( nNew==1 || CORRUPT_DB );
+     rc = defragmentPage(apNew[0], -1);
+     testcase( rc!=SQLITE_OK );
+-    assert( apNew[0]->nFree ==
++    assert( apNew[0]->aData[apNew[0]->hdrOffset]==PTF_FSS_LEAF
++      || apNew[0]->nFree ==
+         (get2byteNotZero(&apNew[0]->aData[5]) - apNew[0]->cellOffset
+           - apNew[0]->nCell*2)
+       || rc!=SQLITE_OK
+@@ -9118,6 +10039,11 @@ static int balance_deeper(MemPage *pRoot, MemPage **ppChild){
+   pChild->nOverflow = pRoot->nOverflow;
+ 
+   /* Zero the contents of pRoot. Then install pChild as the right-child. */
++#ifndef SQLITE_OMIT_FSS
++  if( pChild->aData[pChild->hdrOffset]==PTF_FSS_LEAF ){
++    zeroPage(pRoot, PTF_INTKEY | PTF_LEAFDATA);
++  }else
++#endif
+   zeroPage(pRoot, pChild->aData[0] & ~PTF_LEAF);
+   put4byte(&pRoot->aData[pRoot->hdrOffset+8], pgnoChild);
+ 
+@@ -9438,6 +10364,348 @@ static int btreeOverwriteCell(BtCursor *pCur, const BtreePayload *pX){
+ ** key values and pX->aMem can be used instead of pX->pKey to avoid having
+ ** to decode the key.
+ */
++#define FSS_NOT_APPLICABLE (-999)
++
++static int fssDeriveSchemaFromTable(
++  Table *pTab,
++  FssFieldDesc *aCols,
++  uint16_t *pnCols,
++  uint8_t *pFlags
++){
++  int i;
++  int hasNullable = 0;
++  if( pTab==0 ) return 0;
++  if( !HasRowid(pTab) ) return 0;
++  if( pTab->iPKey >= 0 ) return 0;
++  if( pTab->tabFlags & TF_HasVirtual ) return 0;
++  if( IsVirtual(pTab) ) return 0;
++  if( pTab->nCol <= 0 || pTab->nCol > FSS_MAX_COLUMNS ) return 0;
++
++  for( i=0; i<pTab->nCol; i++ ){
++    Column *pCol = &pTab->aCol[i];
++    char *zType = sqlite3ColumnType(pCol, 0);
++    int type_id = 0;
++    int width = 0;
++    int len;
++    if( zType==0 ) return 0;
++
++    while( *zType==' ' || *zType=='\t' ) zType++;
++    len = (int)strlen(zType);
++    while( len>0 && (zType[len-1]==' ' || zType[len-1]=='\t') ) len--;
++
++    if( (len==4 && sqlite3_strnicmp(zType, "INT8", 4)==0)
++     || (len==4 && sqlite3_strnicmp(zType, "BOOL", 4)==0)
++     || (len==7 && sqlite3_strnicmp(zType, "BOOLEAN", 7)==0) ){
++      type_id = FSS_TYPE_INT8;
++      width = 1;
++    }else if( len==5 && sqlite3_strnicmp(zType, "INT16", 5)==0 ){
++      type_id = FSS_TYPE_INT16;
++      width = 2;
++    }else if( len==5 && sqlite3_strnicmp(zType, "INT32", 5)==0 ){
++      type_id = FSS_TYPE_INT32;
++      width = 4;
++    }else if( (len==3 && sqlite3_strnicmp(zType, "INT", 3)==0)
++           || (len==7 && sqlite3_strnicmp(zType, "INTEGER", 7)==0)
++           || (len==6 && sqlite3_strnicmp(zType, "BIGINT", 6)==0)
++           || (len==5 && sqlite3_strnicmp(zType, "INT64", 5)==0) ){
++      type_id = FSS_TYPE_INT64;
++      width = 8;
++    }else if( (len==7 && sqlite3_strnicmp(zType, "FLOAT64", 7)==0)
++           || (len==6 && sqlite3_strnicmp(zType, "DOUBLE", 6)==0)
++           || (len==4 && sqlite3_strnicmp(zType, "REAL", 4)==0) ){
++      type_id = FSS_TYPE_FLOAT64;
++      width = 8;
++    }else if( len==12 && sqlite3_strnicmp(zType, "TIMESTAMP_US", 12)==0 ){
++      type_id = FSS_TYPE_TIMESTAMP_US;
++      width = 8;
++    }else if( len>6 && sqlite3_strnicmp(zType, "BLOB(", 5)==0 && zType[len-1]==')' ){
++      int k = 0;
++      int j;
++      for( j=5; j<len-1; j++ ){
++        if( zType[j]<'0' || zType[j]>'9' ){ k = 0; break; }
++        k = k*10 + (zType[j]-'0');
++        if( k > 65535 ){ k = 0; break; }
++      }
++      if( k <= 0 ) return 0;
++      type_id = FSS_TYPE_FIXED_BLOB;
++      width = k;
++    }else{
++      return 0;
++    }
++
++    aCols[i].type_id = (uint8_t)type_id;
++    aCols[i].byte_width = (uint16_t)width;
++    aCols[i].col_flags = 0;
++    if( pCol->notNull ){
++      aCols[i].col_flags |= FSS_COL_FLAG_NOT_NULL;
++    }else{
++      hasNullable = 1;
++    }
++  }
++
++  *pnCols = (uint16_t)pTab->nCol;
++  *pFlags = hasNullable ? FSS_FLAG_NULLABLE : 0;
++  return 1;
++}
++
++static int btreeInsertFss(BtCursor *pCur, const BtreePayload *pX, int flags, int loc){
++  MemPage *pPage = pCur->pPage;
++  int rc;
++  FssPage fssPage;
++  FssValue aVals[FSS_MAX_COLUMNS];
++  uint16_t nVals = 0;
++  uint16_t i;
++  int isFss = (pPage->aData[pPage->hdrOffset] == PTF_FSS_LEAF);
++
++  if( !isFss ){
++    /* First-row creation on empty leaf */
++    Table *pTab = (Table*)pCur->pTab;
++    if( pTab==0 ){
++      HashElem *k;
++      Schema *pSchema = pCur->pBtree->pBt->pSchema;
++      if( pSchema ){
++        for(k=sqliteHashFirst(&pSchema->tblHash); k; k=sqliteHashNext(k)){
++          Table *t = (Table *)sqliteHashData(k);
++          if( t->tnum==pCur->pgnoRoot ){ pTab = t; break; }
++        }
++      }
++      if( pTab==0 && pCur->pBtree->db ){
++        sqlite3 *db = pCur->pBtree->db;
++        int iDb;
++        for(iDb=0; iDb<db->nDb; iDb++){
++          Schema *s = db->aDb[iDb].pSchema;
++          if( s && s!=pSchema ){
++            for(k=sqliteHashFirst(&s->tblHash); k; k=sqliteHashNext(k)){
++              Table *t = (Table *)sqliteHashData(k);
++              if( t->tnum==pCur->pgnoRoot ){ pTab = t; break; }
++            }
++            if( pTab ) break;
++          }
++        }
++      }
++    }
++    if( pTab==0 ) return FSS_NOT_APPLICABLE;
++
++    FssFieldDesc aCols[FSS_MAX_COLUMNS];
++    uint16_t nCols = 0;
++    uint8_t fssFlags = 0;
++    if( !fssDeriveSchemaFromTable(pTab, aCols, &nCols, &fssFlags) ){
++      return FSS_NOT_APPLICABLE;
++    }
++
++    rc = fssRecordToValues((const uint8_t*)pX->pData, (uint32_t)pX->nData, aVals, FSS_MAX_COLUMNS, &nVals);
++    if( rc!=FSS_OK ) return FSS_NOT_APPLICABLE;
++    for( i=nVals; i<nCols; i++ ){
++      aVals[i] = fssValueNull();
++    }
++    nVals = nCols;
++
++    FssSchema tempSchema;
++    if( fssSchemaInit(&tempSchema, aCols, nCols, fssFlags)!=FSS_OK ){
++      return FSS_NOT_APPLICABLE;
++    }
++    if( fssCheckRowMatchesSchema(&tempSchema, fssFlags, aVals, nVals)!=FSS_OK ){
++      return FSS_NOT_APPLICABLE;
++    }
++
++    uint16_t cap = fssCalculateCapacity(pPage->pBt->usableSize, pPage->hdrOffset,
++                                        nCols, tempSchema.row_payload_size,
++                                        fssFlags | FSS_FLAG_DENSE_ROWID);
++    if( cap < 1 ) return FSS_NOT_APPLICABLE;
++
++    /* Make page writable and initialize */
++    rc = sqlite3PagerWrite(pPage->pDbPage);
++    if( rc ) return rc;
++
++    /* Write marker to page 1 if needed */
++    if( pCur->pBtree->pBt->pPage1 ){
++      u8 *aDbHdr = pCur->pBtree->pBt->pPage1->aData;
++      if( !fssHasDbMarker(aDbHdr) ){
++        rc = sqlite3PagerWrite(pCur->pBtree->pBt->pPage1->pDbPage);
++        if( rc ) return rc;
++        fssWriteDbMarker(aDbHdr, FSS_DB_VERSION);
++      }
++    }
++
++    fssFlags |= FSS_FLAG_DENSE_ROWID;
++    rc = fssPageInit(pPage->aData, pPage->pBt->usableSize, pPage->hdrOffset,
++                     aCols, nCols, fssFlags, pX->nKey, aVals);
++    if( rc!=FSS_OK ) return SQLITE_CORRUPT_PAGE(pPage);
++
++    pPage->isInit = 0;
++    rc = btreeInitPage(pPage);
++    if( rc ) return rc;
++    rc = btreeComputeFreeSpace(pPage);
++    if( rc ) return rc;
++
++    pCur->ix = 0;
++    pCur->info.nSize = 0;
++    pCur->info.nKey = pX->nKey;
++    pCur->curFlags |= (BTCF_ValidNKey | BTCF_AtLast);
++    pCur->curFlags &= ~BTCF_ValidOvfl;
++    pCur->eState = CURSOR_VALID;
++    getCellInfo(pCur);
++    return SQLITE_OK;
++  }
++
++  /* pPage is already an FSS page */
++  rc = sqlite3PagerWrite(pPage->pDbPage);
++  if( rc ) return rc;
++
++  rc = fssPageParse(pPage->aData, pPage->pBt->usableSize, pPage->hdrOffset, &fssPage);
++  if( rc!=FSS_OK ) return SQLITE_CORRUPT_PAGE(pPage);
++
++  rc = fssRecordToValues((const uint8_t*)pX->pData, (uint32_t)pX->nData, aVals, FSS_MAX_COLUMNS, &nVals);
++  if( rc==FSS_OK ){
++    for( i=nVals; i<fssPage.schema.num_columns; i++ ){
++      aVals[i] = fssValueNull();
++    }
++    nVals = fssPage.schema.num_columns;
++  }
++
++  /* Overwrite existing row */
++  if( loc==0 || ((pCur->curFlags & BTCF_ValidNKey) && pCur->info.nKey==pX->nKey) ){
++    if( rc==FSS_OK && fssCheckRowMatchesSchema(&fssPage.schema, fssPage.hdr.flags, aVals, nVals)==FSS_OK ){
++      uint16_t slot = 0;
++      fssPageFindRow(&fssPage, pX->nKey, &slot);
++      fssWriteSlot(fssPage.aDataArea + slot * fssPage.hdr.row_payload_size,
++                   &fssPage.schema, fssPage.hdr.flags, aVals);
++      pCur->ix = slot;
++      pCur->info.nSize = 0;
++      pCur->info.nKey = pX->nKey;
++      pCur->curFlags |= BTCF_ValidNKey;
++      pCur->curFlags &= ~BTCF_ValidOvfl;
++      getCellInfo(pCur);
++      return SQLITE_OK;
++    }else{
++      rc = fssPageDemoteToDynamic(&fssPage, pX->nKey, aVals, nVals);
++      if( rc==FSS_OK ){
++        pPage->isInit = 0;
++        rc = btreeInitPage(pPage);
++        if( rc ) return rc;
++        rc = btreeComputeFreeSpace(pPage);
++        if( rc ) return rc;
++        pCur->curFlags &= ~(BTCF_ValidNKey | BTCF_ValidOvfl);
++        pCur->info.nSize = 0;
++        if( flags & BTREE_SAVEPOSITION ){
++          btreeReleaseAllCursorPages(pCur);
++          pCur->eState = CURSOR_REQUIRESEEK;
++          pCur->nKey = pX->nKey;
++        }else{
++          pCur->eState = CURSOR_INVALID;
++        }
++        return SQLITE_OK;
++      }
++      if( rc==FSS_SPLIT_REQUIRED ){
++        rc = fssPageDemoteToDynamic(&fssPage, 0, NULL, 0);
++        if( rc==FSS_OK ){
++          pPage->isInit = 0;
++          rc = btreeInitPage(pPage);
++          if( rc ) return rc;
++          rc = btreeComputeFreeSpace(pPage);
++          if( rc ) return rc;
++          pCur->curFlags &= ~(BTCF_ValidNKey | BTCF_ValidOvfl);
++          pCur->info.nSize = 0;
++          return FSS_NOT_APPLICABLE;
++        }
++      }
++      return SQLITE_FULL;
++    }
++  }
++
++  /* Insert new row */
++  if( rc==FSS_OK && fssCheckRowMatchesSchema(&fssPage.schema, fssPage.hdr.flags, aVals, nVals)==FSS_OK ){
++    rc = fssPageInsert(&fssPage, pX->nKey, aVals, nVals);
++    if( rc==FSS_OK ){
++      pPage->nCell = fssPage.hdr.cell_count;
++      pPage->cellOffset = fssPage.hdr.data_area_offset;
++      fssPageFindRow(&fssPage, pX->nKey, &pCur->ix);
++      pCur->info.nSize = 0;
++      pCur->info.nKey = pX->nKey;
++      pCur->curFlags |= BTCF_ValidNKey;
++      pCur->curFlags &= ~BTCF_ValidOvfl;
++      if( pCur->ix == pPage->nCell - 1 ){
++        pCur->curFlags |= BTCF_AtLast;
++      }else{
++        pCur->curFlags &= ~BTCF_AtLast;
++      }
++      pCur->eState = CURSOR_VALID;
++      getCellInfo(pCur);
++      return SQLITE_OK;
++    }else if( rc==FSS_DUPLICATE ){
++      return SQLITE_CONSTRAINT_PRIMARYKEY;
++    }else if( rc==FSS_FULL ){
++      BtShared *pBt = pCur->pBtree->pBt;
++      u8 *pTmp = pBt->pTmpSpace;
++      uint16_t targetSlot = 0;
++      if( pTmp==0 ){
++        rc = allocateTempSpace(pBt);
++        if( rc!=SQLITE_OK ) return rc;
++        pTmp = pBt->pTmpSpace;
++      }
++
++      /* Write overflow row into pTmp: 8 bytes rowid + slot data */
++      fssPutI64(pTmp, pX->nKey);
++      fssWriteSlot(pTmp + 8, &fssPage.schema, fssPage.hdr.flags, aVals);
++
++      fssPageFindRow(&fssPage, pX->nKey, &targetSlot);
++
++      pPage->apOvfl[0] = pTmp;
++      pPage->aiOvfl[0] = targetSlot;
++      pPage->nOverflow = 1;
++
++      if( pPage->nFree<0 ){
++        rc = btreeComputeFreeSpace(pPage);
++        if( rc!=SQLITE_OK ) return rc;
++      }
++
++      pCur->curFlags &= ~(BTCF_ValidNKey | BTCF_ValidOvfl);
++      rc = balance(pCur);
++
++      pCur->pPage->nOverflow = 0;
++      pCur->eState = CURSOR_INVALID;
++      if( (flags & BTREE_SAVEPOSITION) && rc==SQLITE_OK ){
++        btreeReleaseAllCursorPages(pCur);
++      }
++      return rc;
++    }
++  }
++
++  /* Type/width mismatch: demote page to dynamic 0x0D */
++  rc = fssPageDemoteToDynamic(&fssPage, pX->nKey, aVals, nVals);
++  if( rc==FSS_OK ){
++    pPage->isInit = 0;
++    rc = btreeInitPage(pPage);
++    if( rc ) return rc;
++    rc = btreeComputeFreeSpace(pPage);
++    if( rc ) return rc;
++    pCur->curFlags &= ~(BTCF_ValidNKey | BTCF_ValidOvfl);
++    pCur->info.nSize = 0;
++    if( flags & BTREE_SAVEPOSITION ){
++      btreeReleaseAllCursorPages(pCur);
++      pCur->eState = CURSOR_REQUIRESEEK;
++      pCur->nKey = pX->nKey;
++    }else{
++      pCur->eState = CURSOR_INVALID;
++    }
++    return SQLITE_OK;
++  }
++  if( rc==FSS_SPLIT_REQUIRED ){
++    rc = fssPageDemoteToDynamic(&fssPage, 0, NULL, 0);
++    if( rc==FSS_OK ){
++      pPage->isInit = 0;
++      rc = btreeInitPage(pPage);
++      if( rc ) return rc;
++      rc = btreeComputeFreeSpace(pPage);
++      if( rc ) return rc;
++      pCur->curFlags &= ~(BTCF_ValidNKey | BTCF_ValidOvfl);
++      pCur->info.nSize = 0;
++      return FSS_NOT_APPLICABLE;
++    }
++  }
++  return SQLITE_FULL;
++}
++
+ int sqlite3BtreeInsert(
+   BtCursor *pCur,                /* Insert data into the table of this cursor */
+   const BtreePayload *pX,        /* Content of the row to be inserted */
+@@ -9530,6 +10798,10 @@ int sqlite3BtreeInsert(
+       /* The cursor is pointing to the entry that is to be
+       ** overwritten */
+       assert( pX->nData>=0 && pX->nZero>=0 );
++      if( pCur->pPage->aData[pCur->pPage->hdrOffset]==PTF_FSS_LEAF ){
++        rc = btreeInsertFss(pCur, pX, flags, 0);
++        if( rc!=FSS_NOT_APPLICABLE ) return rc;
++      }
+       if( pCur->info.nSize!=0
+        && pCur->info.nPayload==(u32)pX->nData+pX->nZero
+       ){
+@@ -9594,6 +10866,14 @@ int sqlite3BtreeInsert(
+        || (pCur->eState==CURSOR_INVALID && loc) || CORRUPT_DB );
+ 
+   pPage = pCur->pPage;
++  if( pCur->pKeyInfo==0 ){
++    if( pPage->aData[pPage->hdrOffset]==PTF_FSS_LEAF
++     || (pPage->nCell==0 && (p->db->flags & SQLITE_FixedSchema))
++    ){
++      rc = btreeInsertFss(pCur, pX, flags, loc);
++      if( rc!=FSS_NOT_APPLICABLE ) return rc;
++    }
++  }
+   assert( pPage->intKey || pX->nKey>=0 || (flags & BTREE_PREFORMAT) );
+   assert( pPage->leaf || !pPage->intKey );
+   if( pPage->nFree<0 ){
+@@ -9853,6 +11133,65 @@ int sqlite3BtreeTransferRow(BtCursor *pDest, BtCursor *pSrc, i64 iKey){
+   }
+ }
+ 
++#ifndef SQLITE_OMIT_FSS
++/*
++** Delete a row from an FSS leaf page.
++** Handles compacting slots, underflow / teardown, and dense-to-sparse splitting.
++*/
++static int btreeDeleteFss(BtCursor *pCur, MemPage *pPage, int iCellIdx){
++  int rc;
++  FssPage fssPage;
++  i64 rowid;
++
++  rc = sqlite3PagerWrite(pPage->pDbPage);
++  if( rc ) return rc;
++
++  rc = fssPageParse(pPage->aData, pPage->pBt->usableSize, pPage->hdrOffset, &fssPage);
++  if( rc!=FSS_OK ) return SQLITE_CORRUPT_PAGE(pPage);
++
++  rowid = fssGetRowid(pPage, iCellIdx);
++  rc = fssPageDelete(&fssPage, rowid);
++
++  if( rc==FSS_OK ){
++    pPage->isInit = 0;
++    rc = btreeInitPage(pPage);
++    if( rc ) return rc;
++    return btreeComputeFreeSpace(pPage);
++  }
++
++  if( rc==FSS_UNDERFLOW ){
++    if( pCur->iPage==0 ){
++      /* Root page teardown: reset root page to standard empty 0x0D leaf */
++      zeroPage(pPage, PTF_INTKEY | PTF_LEAFDATA | PTF_LEAF);
++      pPage->isInit = 0;
++      rc = btreeInitPage(pPage);
++      if( rc ) return rc;
++      return btreeComputeFreeSpace(pPage);
++    }else{
++      /* Non-root child leaf teardown: clear cell count and recompute free space */
++      pPage->nCell = 0;
++      pPage->aData[pPage->hdrOffset + FSS_HDR_CELL_COUNT] = 0;
++      pPage->aData[pPage->hdrOffset + FSS_HDR_CELL_COUNT + 1] = 0;
++      pPage->isInit = 0;
++      rc = btreeInitPage(pPage);
++      if( rc ) return rc;
++      return btreeComputeFreeSpace(pPage);
++    }
++  }
++
++  if( rc==FSS_FULL ){
++    /* Dense middle delete cannot fit sparse rowid index in this page.
++    ** Mark cell as overflow so balance() will rebalance it across siblings. */
++    pPage->apOvfl[0] = (u8*)1;
++    pPage->aiOvfl[0] = (u16)iCellIdx;
++    pPage->nOverflow = 1;
++    return SQLITE_OK;
++  }
++
++  return SQLITE_CORRUPT_PAGE(pPage);
++}
++#endif
++
+ /*
+ ** Delete the entry that the cursor is pointing to.
+ **
+@@ -9909,9 +11248,15 @@ int sqlite3BtreeDelete(BtCursor *pCur, u8 flags){
+   if( pPage->nFree<0 && btreeComputeFreeSpace(pPage) ){
+     return SQLITE_CORRUPT_PAGE(pPage);
+   }
++#ifndef SQLITE_OMIT_FSS
++  if( pPage->aData[pPage->hdrOffset]!=PTF_FSS_LEAF && pCell<&pPage->aCellIdx[pPage->nCell] ){
++    return SQLITE_CORRUPT_PAGE(pPage);
++  }
++#else
+   if( pCell<&pPage->aCellIdx[pPage->nCell] ){
+     return SQLITE_CORRUPT_PAGE(pPage);
+   }
++#endif
+ 
+   /* If the BTREE_SAVEPOSITION bit is on, then the cursor position must
+   ** be preserved following this delete operation. If the current delete
+@@ -9931,7 +11276,28 @@ int sqlite3BtreeDelete(BtCursor *pCur, u8 flags){
+   */
+   bPreserve = (flags & BTREE_SAVEPOSITION)!=0;
+   if( bPreserve ){
++    int willRebalance = 0;
++#ifndef SQLITE_OMIT_FSS
++    if( pPage->aData[pPage->hdrOffset]==PTF_FSS_LEAF ){
++      FssPage fssPage;
++      if( fssPageParse(pPage->aData, pBt->usableSize, pPage->hdrOffset, &fssPage)==FSS_OK ){
++        if( fssPage.hdr.cell_count <= 1 ){
++          willRebalance = 1;
++        }else if( (fssPage.hdr.flags & FSS_FLAG_DENSE_ROWID)
++               && iCellIdx > 0 && iCellIdx < fssPage.hdr.cell_count - 1
++        ){
++          uint16_t newCap = fssCalculateCapacity(pBt->usableSize, pPage->hdrOffset,
++                              fssPage.schema.num_columns, fssPage.hdr.row_payload_size,
++                              fssPage.hdr.flags & ~FSS_FLAG_DENSE_ROWID);
++          if( newCap==0 || (fssPage.hdr.cell_count - 1) > newCap ){
++            willRebalance = 1;
++          }
++        }
++      }
++    }
++#endif
+     if( !pPage->leaf
++     || willRebalance
+      || (pPage->nFree+pPage->xCellSize(pPage,pCell)+2) >
+                                                    (int)(pBt->usableSize*2/3)
+      || pPage->nCell==1  /* See dbfuzz001.test for a test case */
+@@ -9976,9 +11342,17 @@ int sqlite3BtreeDelete(BtCursor *pCur, u8 flags){
+   ** itself from within the page.  */
+   rc = sqlite3PagerWrite(pPage->pDbPage);
+   if( rc ) return rc;
+-  BTREE_CLEAR_CELL(rc, pPage, pCell, info);
+-  dropCell(pPage, iCellIdx, info.nSize, &rc);
+-  if( rc ) return rc;
++#ifndef SQLITE_OMIT_FSS
++  if( pPage->aData[pPage->hdrOffset]==PTF_FSS_LEAF ){
++    rc = btreeDeleteFss(pCur, pPage, iCellIdx);
++    if( rc ) return rc;
++  }else
++#endif
++  {
++    BTREE_CLEAR_CELL(rc, pPage, pCell, info);
++    dropCell(pPage, iCellIdx, info.nSize, &rc);
++    if( rc ) return rc;
++  }
+ 
+   /* If the cell deleted was not located on a leaf page, then the cursor
+   ** is currently pointing to the largest entry in the sub-tree headed
+@@ -10973,6 +12347,23 @@ static int checkTreePage(
+   data = pPage->aData;
+   hdr = pPage->hdrOffset;
+ 
++  if( pPage->aData[hdr]==PTF_FSS_LEAF ){
++    pCheck->zPfx = "Tree %u page %u cell %u: ";
++    pCheck->nRow += pPage->nCell;
++    for( i = pPage->nCell - 1; i >= 0 && pCheck->mxErr; i-- ){
++      i64 nKey = fssGetRowid(pPage, i);
++      pCheck->v2 = i;
++      if( keyCanBeEqual ? (nKey > maxKey) : (nKey >= maxKey) ){
++        checkAppendMsg(pCheck, "Rowid %lld out of order", nKey);
++      }
++      maxKey = nKey;
++      keyCanBeEqual = 0;
++    }
++    *piMinKey = maxKey;
++    doCoverageCheck = 0;
++    goto end_of_check;
++  }
++
+   /* Set up for cell analysis */
+   pCheck->zPfx = "Tree %u page %u cell %u: ";
+   contentOffset = get2byteNotZero(&data[hdr+5]);
+diff --git a/src/btree.h b/src/btree.h
+index 043056e32..1a8167b5e 100644
+--- a/src/btree.h
++++ b/src/btree.h
+@@ -106,6 +106,8 @@ int sqlite3BtreeSavepoint(Btree *, int, int);
+ const char *sqlite3BtreeGetFilename(Btree *);
+ const char *sqlite3BtreeGetJournalname(Btree *);
+ int sqlite3BtreeCopyFile(Btree*, Btree*);
++int sqlite3BtreeSetFssFormat(Btree*, u32);
++int sqlite3BtreeGetFssFormat(Btree*);
+ 
+ int sqlite3BtreeIncrVacuum(Btree *);
+ 
 diff --git a/src/btreeInt.h b/src/btreeInt.h
-index 5bc24b349..c9c68bf71 100644
+index 5bc24b349..c7b9acf7d 100644
 --- a/src/btreeInt.h
 +++ b/src/btreeInt.h
-@@ -257,6 +257,19 @@ typedef struct CellInfo CellInfo;
+@@ -257,6 +257,35 @@ typedef struct CellInfo CellInfo;
  #define PTF_ZERODATA  0x02
  #define PTF_LEAFDATA  0x04
  #define PTF_LEAF      0x08
@@ -153,15 +1708,73 @@ index 5bc24b349..c9c68bf71 100644
 +void fssExtractColumn(MemPage *pPage, const u8 *pCell, int iCol, Mem *pDest);
 +int fssInitPageFromRecord(MemPage *pPage, const u8 *pData, int nData);
 +int fssInsertRecord(MemPage *pPage, i64 rowid, const u8 *pData, int nData);
++int sqlite3FssValidateDbMarker(const u8 *aDbHdr, u32 *pVersion);
++int sqlite3FssWriteDbMarker(u8 *aDbHdr, u32 version);
++int sqlite3BtreeSetFssFormat(Btree *p, u32 version);
++int sqlite3BtreeGetFssFormat(Btree *p);
++int sqlite3BtreeMarkFss(BtShared *pBt);
++
++#define FSS_DB_MARKER_OFFSET 72
++#define FSS_DB_MARKER_SIZE   8
++#define FSS_DB_MAGIC         "FSS1"
++#define FSS_DB_MAGIC_SIZE    4
++#define FSS_DB_VERSION       1
++
++#define FSS_MARKER_NONE            0
++#define FSS_MARKER_VALID           1
++#define FSS_MARKER_UNSUPPORTED_VER 2
++#define FSS_MARKER_INVALID         3
 +
  
  /*
  ** An instance of this object stores information about each a single database
+@@ -471,6 +500,7 @@ struct BtShared {
+ #define BTS_NO_WAL           0x0020   /* Do not open write-ahead-log files */
+ #define BTS_EXCLUSIVE        0x0040   /* pWriter has an exclusive lock */
+ #define BTS_PENDING          0x0080   /* Waiting for read-locks to clear */
++#define BTS_FSS              0x0100   /* Database has FSS format marker */
+ 
+ /*
+ ** An instance of the following structure is used to hold information
+@@ -541,6 +571,7 @@ struct BtCursor {
+ #if defined(SQLITE_ENABLE_CURSOR_HINTS) && defined(SQLITE_DEBUG)
+   BtCursor *pCursorHintTableCursor;
+ #endif
++  void *pTab;               /* Table schema object, if known */
+   /* All fields above are zeroed when the cursor is allocated.  See
+   ** sqlite3BtreeCursorZero().  Fields that follow must be manually
+   ** initialized. */
+diff --git a/src/prepare.c b/src/prepare.c
+index 19b554607..4914e5feb 100644
+--- a/src/prepare.c
++++ b/src/prepare.c
+@@ -281,7 +281,12 @@ int sqlite3InitOne(sqlite3 *db, int iDb, char **pzErrMsg, u32 mFlags){
+   if( sqlite3BtreeTxnState(pDb->pBt)==SQLITE_TXN_NONE ){
+     rc = sqlite3BtreeBeginTrans(pDb->pBt, 0, 0);
+     if( rc!=SQLITE_OK ){
+-      sqlite3SetString(pzErrMsg, db, sqlite3ErrStr(rc));
++      const char *zErr = sqlite3_errmsg(db);
++      if( zErr && zErr[0] && strcmp(zErr, "not an error")!=0 && strcmp(zErr, sqlite3ErrStr(rc))!=0 ){
++        sqlite3SetString(pzErrMsg, db, zErr);
++      }else{
++        sqlite3SetString(pzErrMsg, db, sqlite3ErrStr(rc));
++      }
+       goto initone_error_out;
+     }
+     openedTransaction = 1;
 diff --git a/src/sqliteInt.h b/src/sqliteInt.h
-index f0c169c8d..637e43306 100644
+index f0c169c8d..2b2f1c932 100644
 --- a/src/sqliteInt.h
 +++ b/src/sqliteInt.h
-@@ -1906,6 +1906,7 @@ struct sqlite3 {
+@@ -1469,6 +1469,7 @@ typedef int VList;
+ #include "vdbe.h"
+ #include "pcache.h"
+ #include "mutex.h"
++#include "fss.h"
+ 
+ /* The SQLITE_EXTRA_DURABLE compile-time option used to set the default
+ ** synchronous setting to EXTRA.  It is no longer supported.
+@@ -1906,6 +1907,7 @@ struct sqlite3 {
  #define SQLITE_AttachCreate   HI(0x00010) /* ATTACH allowed to create new dbs */
  #define SQLITE_AttachWrite    HI(0x00020) /* ATTACH allowed to open for write */
  #define SQLITE_Comments       HI(0x00040) /* Enable SQL comments */
@@ -169,19 +1782,38 @@ index f0c169c8d..637e43306 100644
  
  /* Flags used only if debugging */
  #ifdef SQLITE_DEBUG
+diff --git a/src/vacuum.c b/src/vacuum.c
+index 70e62e1ef..b6815f42e 100644
+--- a/src/vacuum.c
++++ b/src/vacuum.c
+@@ -374,6 +374,12 @@ SQLITE_NOINLINE int sqlite3RunVacuum(
+       rc = sqlite3BtreeUpdateMeta(pTemp, aCopy[i], meta+aCopy[i+1]);
+       if( NEVER(rc!=SQLITE_OK) ) goto end_of_vacuum;
+     }
++#ifndef SQLITE_OMIT_FSS
++    if( sqlite3BtreeGetFssFormat(pMain)>0 ){
++      rc = sqlite3BtreeSetFssFormat(pTemp, FSS_DB_VERSION);
++      if( rc!=SQLITE_OK ) goto end_of_vacuum;
++    }
++#endif
+ 
+     if( pOut==0 ){
+       rc = sqlite3BtreeCopyFile(pMain, pTemp);
 diff --git a/src/vdbe.c b/src/vdbe.c
-index f7358a6cb..a11f7511b 100644
+index f7358a6cb..57cfc6d39 100644
 --- a/src/vdbe.c
 +++ b/src/vdbe.c
-@@ -895,6 +895,87 @@ static const char *vdbeMemTypeName(Mem *pMem){
+@@ -895,6 +895,83 @@ static const char *vdbeMemTypeName(Mem *pMem){
    return azTypes[sqlite3_value_type(pMem)-1];
  }
  
 +void fssExtractColumn(MemPage *pPage, const u8 *pSlot, int iCol, Mem *pDest){
 +  u8 *data = pPage->aData + pPage->hdrOffset;
-+  u8 flags = data[1];
-+  u16 nCols = get2byte(&data[16]);
-+  u16 nullBytes = (flags & 0x02) ? ((nCols + 7) / 8) : 0;
++  u8 flags = data[FSS_HDR_FLAGS];
++  u16 fieldDescOffset = get2byte(&data[FSS_HDR_FIELD_DESC_OFFSET]);
++  const u8 *pDesc = data + fieldDescOffset;
++  u16 nCols = get2byte(&pDesc[FSS_SCHEMA_NUM_COLUMNS]);
++  u16 nullBytes = (flags & FSS_FLAG_NULLABLE) ? ((nCols + 7) / 8) : 0;
 +  int i;
 +  u16 offset = 0;
 +  if( iCol < 0 || iCol >= nCols ){
@@ -195,59 +1827,53 @@ index f7358a6cb..a11f7511b 100644
 +    }
 +  }
 +  for( i = 0; i < iCol; i++ ){
-+    u8 *desc = &data[18 + i * 4];
++    const u8 *desc = pDesc + FSS_SCHEMA_COLUMNS + i * FSS_FIELD_DESC_SIZE;
 +    offset += get2byte(&desc[2]);
 +  }
-+  u8 *desc = &data[18 + iCol * 4];
++  const u8 *desc = pDesc + FSS_SCHEMA_COLUMNS + iCol * FSS_FIELD_DESC_SIZE;
 +  u8 type_id = desc[0];
 +  u16 width = get2byte(&desc[2]);
 +  const u8 *pSrc = pSlot + nullBytes + offset;
 +  switch( type_id ){
-+    case 0x01: { /* INT8 / BOOL */
-+      pDest->flags = MEM_Int;
-+      pDest->u.i = (signed char)*pSrc;
++    case FSS_TYPE_INT8: { /* INT8 / BOOL */
++      sqlite3VdbeMemSetInt64(pDest, (signed char)*pSrc);
 +      break;
 +    }
-+    case 0x02: { /* INT16 */
-+      pDest->flags = MEM_Int;
-+      pDest->u.i = (i16)get2byte(pSrc);
++    case FSS_TYPE_INT16: { /* INT16 */
++      sqlite3VdbeMemSetInt64(pDest, (i16)get2byte(pSrc));
 +      break;
 +    }
-+    case 0x03: { /* INT32 */
-+      pDest->flags = MEM_Int;
-+      pDest->u.i = (int)get4byte(pSrc);
++    case FSS_TYPE_INT32: { /* INT32 */
++      sqlite3VdbeMemSetInt64(pDest, (int)get4byte(pSrc));
 +      break;
 +    }
-+    case 0x04:
-+    case 0x08: { /* INT64 / TIMESTAMP */
++    case FSS_TYPE_INT64:
++    case FSS_TYPE_TIMESTAMP_US: { /* INT64 / TIMESTAMP */
 +      u64 v = 0;
 +      for( i=0; i<8; i++ ) v = (v<<8) | pSrc[i];
-+      pDest->flags = MEM_Int;
-+      pDest->u.i = (i64)v;
++      sqlite3VdbeMemSetInt64(pDest, (i64)v);
 +      break;
 +    }
-+    case 0x05: { /* FLOAT32 */
++    case FSS_TYPE_FLOAT32: { /* FLOAT32 */
 +      u32 u = get4byte(pSrc);
 +      float f;
 +      memcpy(&f, &u, 4);
-+      pDest->flags = MEM_Real;
-+      pDest->u.r = (double)f;
++      sqlite3VdbeMemSetDouble(pDest, (double)f);
 +      break;
 +    }
-+    case 0x06: { /* FLOAT64 */
++    case FSS_TYPE_FLOAT64: { /* FLOAT64 */
 +      u64 u = 0;
 +      for( i=0; i<8; i++ ) u = (u<<8) | pSrc[i];
 +      double d;
 +      memcpy(&d, &u, 8);
-+      pDest->flags = MEM_Real;
-+      pDest->u.r = d;
++      sqlite3VdbeMemSetDouble(pDest, d);
 +      break;
 +    }
-+    case 0x07: { /* FIXED_BLOB */
++    case FSS_TYPE_FIXED_BLOB: { /* FIXED_BLOB */
 +      sqlite3VdbeMemSetStr(pDest, (const char*)pSrc, width, 0, SQLITE_TRANSIENT);
 +      break;
 +    }
-+    case 0x0A: { /* TEXT */
++    case FSS_TYPE_TEXT: { /* TEXT */
 +      sqlite3VdbeMemSetStr(pDest, (const char*)pSrc, width, SQLITE_UTF8, SQLITE_TRANSIENT);
 +      break;
 +    }
@@ -261,11 +1887,65 @@ index f7358a6cb..a11f7511b 100644
  /*
  ** Execute as much of a VDBE program as we can.
  ** This is the core of sqlite3_step(). 
-@@ -3104,6 +3185,12 @@ op_column_restart:
+@@ -2867,8 +2944,51 @@ case OP_IsType: {        /* jump */
+   if( pOp->p1>=0 ){
+     pC = p->apCsr[pOp->p1];
+     assert( pC!=0 );
+-    assert( pOp->p3>=0 );
+-    if( pOp->p3<pC->nHdrParsed ){
++    if( pC->eCurType==CURTYPE_BTREE && pC->uc.pCursor
++     && pC->uc.pCursor->pPage
++     && pC->uc.pCursor->pPage->aData[pC->uc.pCursor->pPage->hdrOffset]==PTF_FSS_LEAF ){
++      MemPage *pFssPage = pC->uc.pCursor->pPage;
++      u8 *fData = pFssPage->aData + pFssPage->hdrOffset;
++      u8 fFlags = fData[FSS_HDR_FLAGS];
++      u16 fDescOff = get2byte(&fData[FSS_HDR_FIELD_DESC_OFFSET]);
++      const u8 *pFDesc = fData + fDescOff;
++      u16 fNCols = get2byte(&pFDesc[FSS_SCHEMA_NUM_COLUMNS]);
++      if( pOp->p3 >= fNCols ){
++        typeMask = 0x10; /* SQLITE_NULL */
++      }else{
++        u16 fNullBytes = (fFlags & FSS_FLAG_NULLABLE) ? ((fNCols + 7) / 8) : 0;
++        const u8 *pSlot = pC->aRow;
++        if( pSlot==0 && sqlite3BtreeCursorIsValidNN(pC->uc.pCursor) ){
++          pC->payloadSize = sqlite3BtreePayloadSize(pC->uc.pCursor);
++          pC->aRow = pSlot = sqlite3BtreePayloadFetch(pC->uc.pCursor, &pC->szRow);
++        }
++        if( fNullBytes > 0 && pSlot && (pSlot[pOp->p3 / 8] & (1 << (pOp->p3 % 8))) ){
++          typeMask = 0x10; /* SQLITE_NULL */
++        }else{
++          const u8 *desc = pFDesc + FSS_SCHEMA_COLUMNS + pOp->p3 * FSS_FIELD_DESC_SIZE;
++          u8 fType = desc[0];
++          switch( fType ){
++            case FSS_TYPE_INT8:
++            case FSS_TYPE_INT16:
++            case FSS_TYPE_INT32:
++            case FSS_TYPE_INT64:
++            case FSS_TYPE_TIMESTAMP_US:
++              typeMask = 0x01; /* SQLITE_INTEGER */
++              break;
++            case FSS_TYPE_FLOAT32:
++            case FSS_TYPE_FLOAT64:
++              typeMask = 0x02; /* SQLITE_FLOAT */
++              break;
++            case FSS_TYPE_FIXED_BLOB:
++              typeMask = 0x08; /* SQLITE_BLOB */
++              break;
++            default:
++              typeMask = 0x10; /* SQLITE_NULL */
++              break;
++          }
++        }
++      }
++    }else if( pOp->p3<pC->nHdrParsed ){
+       serialType = pC->aType[pOp->p3];
+       if( serialType>=12 ){
+         if( serialType&1 ){
+@@ -3104,6 +3224,12 @@ op_column_restart:
        assert( pC->szRow<=pC->payloadSize );
        assert( pC->szRow<=65536 );  /* Maximum page size is 64KiB */
      }
-+    if( pCrsr && pCrsr->pPage && pCrsr->pPage->aData[pCrsr->pPage->hdrOffset]==PTF_FSS_LEAF ){
++    if( pC->eCurType==CURTYPE_BTREE && pCrsr && pCrsr->pPage && pCrsr->pPage->aData[pCrsr->pPage->hdrOffset]==PTF_FSS_LEAF ){
 +      pDest = &aMem[pOp->p3];
 +      memAboutToChange(p, pDest);
 +      fssExtractColumn(pCrsr->pPage, pC->aRow, (int)p2, pDest);
@@ -274,6 +1954,16 @@ index f7358a6cb..a11f7511b 100644
      pC->cacheStatus = p->cacheCtr;
      if( (aOffset[0] = pC->aRow[0])<0x80 ){
        pC->iHdrOffset = 1;
+@@ -5919,6 +6045,9 @@ case OP_Insert: {
+   assert( pC->uc.pCursor!=0 );
+   assert( (pOp->p5 & OPFLAG_ISNOOP) || pC->isTable );
+   assert( pOp->p4type==P4_TABLE || pOp->p4type>=P4_STATIC );
++  if( pOp->p4type==P4_TABLE ){
++    pC->uc.pCursor->pTab = pOp->p4.pTab;
++  }
+   REGISTER_TRACE(pOp->p2, pData);
+   sqlite3VdbeIncrWriteCounter(p, pC);
+ 
 diff --git a/tool/mkpragmatab.tcl b/tool/mkpragmatab.tcl
 index 78127f74a..2b845ebf5 100644
 --- a/tool/mkpragmatab.tcl
@@ -300,3 +1990,31 @@ index 78127f74a..2b845ebf5 100644
    NAME: default_cache_size
    FLAG: NeedSchema Result0 SchemaReq NoColumns1
    COLS: cache_size
+diff --git a/tool/mksqlite3c.tcl b/tool/mksqlite3c.tcl
+index fac29638a..8f8a66930 100644
+--- a/tool/mksqlite3c.tcl
++++ b/tool/mksqlite3c.tcl
+@@ -167,6 +167,7 @@ close $in
+ foreach hdr {
+    btree.h
+    btreeInt.h
++   fss.h
+    fts3.h
+    fts3Int.h
+    fts3_hash.h
+@@ -210,6 +211,7 @@ set available_hdr(sqlite3session.h) 0
+ # These headers should be copied into the amalgamation without modifying any
+ # of their function declarations or definitions.
+ set varonly_hdr(sqlite3.h) 1
++set varonly_hdr(fss.h) 1
+ 
+ # These are the functions that accept a variable number of arguments.  They
+ # always need to use the "cdecl" calling convention even when another calling
+@@ -422,6 +424,7 @@ set flist {
+    wal.c
+ 
+    btmutex.c
++   fss.c
+    btree.c
+    backup.c
+ 

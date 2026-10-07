@@ -436,6 +436,164 @@ static void test_fss_root_page1_offset(void) {
   printf("  PASS: test_fss_root_page1_offset\n");
 }
 
+static void test_fss_db_marker(void) {
+  printf("Running test_fss_db_marker...\n");
+  uint8_t dbHdr[100];
+  uint32_t version = 999;
+
+  /* 1. All zeros represents a standard SQLite database */
+  memset(dbHdr, 0, sizeof(dbHdr));
+  int rc = fssValidateDbMarker(dbHdr, &version);
+  assert(rc == FSS_MARKER_NONE);
+  assert(version == 0);
+  assert(fssHasDbMarker(dbHdr) == 0);
+
+  /* 2. Write valid FSS1 marker with version 1 */
+  rc = fssWriteDbMarker(dbHdr, FSS_DB_VERSION);
+  assert(rc == FSS_OK);
+  assert(fssHasDbMarker(dbHdr) == 1);
+  assert(memcmp(dbHdr + FSS_DB_MARKER_OFFSET, "FSS1\0\0\0\1", 8) == 0);
+
+  version = 0;
+  rc = fssValidateDbMarker(dbHdr, &version);
+  assert(rc == FSS_MARKER_VALID);
+  assert(version == FSS_DB_VERSION);
+
+  /* 3. Unsupported version (e.g. version 2 or version 0) */
+  rc = fssWriteDbMarker(dbHdr, 2);
+  assert(rc == FSS_OK);
+  assert(fssHasDbMarker(dbHdr) == 1);
+  version = 0;
+  rc = fssValidateDbMarker(dbHdr, &version);
+  assert(rc == FSS_MARKER_UNSUPPORTED_VER);
+  assert(version == 2);
+
+  rc = fssWriteDbMarker(dbHdr, 0);
+  assert(rc == FSS_OK);
+  version = 999;
+  rc = fssValidateDbMarker(dbHdr, &version);
+  assert(rc == FSS_MARKER_UNSUPPORTED_VER);
+  assert(version == 0);
+
+  /* 4. Invalid non-zero marker */
+  memcpy(dbHdr + FSS_DB_MARKER_OFFSET, "FSS2\0\0\0\1", 8);
+  rc = fssValidateDbMarker(dbHdr, &version);
+  assert(rc == FSS_MARKER_INVALID);
+
+  memcpy(dbHdr + FSS_DB_MARKER_OFFSET, "CORRUPT!", 8);
+  rc = fssValidateDbMarker(dbHdr, &version);
+  assert(rc == FSS_MARKER_INVALID);
+
+  /* 5. Clear marker */
+  rc = fssClearDbMarker(dbHdr);
+  assert(rc == FSS_OK);
+  assert(fssHasDbMarker(dbHdr) == 0);
+  rc = fssValidateDbMarker(dbHdr, &version);
+  assert(rc == FSS_MARKER_NONE);
+  assert(version == 0);
+
+  /* 6. NULL error handling */
+  assert(fssValidateDbMarker(NULL, &version) == FSS_ERROR);
+  assert(fssWriteDbMarker(NULL, 1) == FSS_ERROR);
+  assert(fssClearDbMarker(NULL) == FSS_ERROR);
+  assert(fssHasDbMarker(NULL) == 0);
+
+  printf("  PASS: test_fss_db_marker\n");
+}
+
+static void test_fss_malformed_and_edge_cases(void) {
+  printf("Running test_fss_malformed_and_edge_cases...\n");
+  uint8_t page[PAGE_SIZE];
+  uint8_t pageCorrupt[PAGE_SIZE];
+
+  FssFieldDesc cols[2] = {
+    { FSS_TYPE_INT32, FSS_COL_FLAG_NOT_NULL, 4 },
+    { FSS_TYPE_FLOAT64, FSS_COL_FLAG_NOT_NULL, 8 }
+  };
+  FssValue vals[2] = { fssValueInt(123), fssValueFloat(4.56) };
+
+  int rc = fssPageInit(page, PAGE_SIZE, 0, cols, 2, FSS_FLAG_DENSE_ROWID, 1, vals);
+  assert(rc == FSS_OK);
+
+  FssPage p;
+
+  /* 1. NULL buffer or small page size */
+  assert(fssPageParse(NULL, PAGE_SIZE, 0, &p) == FSS_ERROR);
+  assert(fssPageParse(page, 256, 0, &p) == FSS_ERROR);
+  assert(fssPageParse(page, PAGE_SIZE, 4090, &p) == FSS_ERROR);
+
+  /* 2. Wrong page type (not 0x0E) */
+  memcpy(pageCorrupt, page, PAGE_SIZE);
+  pageCorrupt[0] = 0x0D;
+  assert(fssPageParse(pageCorrupt, PAGE_SIZE, 0, &p) == FSS_CORRUPT);
+
+  /* 3. Unsupported flags */
+  memcpy(pageCorrupt, page, PAGE_SIZE);
+  pageCorrupt[1] = 0x04; /* Bit 2 is reserved / unsupported */
+  assert(fssPageParse(pageCorrupt, PAGE_SIZE, 0, &p) == FSS_CORRUPT);
+
+  /* 4. Wrong schema version */
+  memcpy(pageCorrupt, page, PAGE_SIZE);
+  pageCorrupt[2] = 0x00;
+  pageCorrupt[3] = 0x02; /* version 2 */
+  assert(fssPageParse(pageCorrupt, PAGE_SIZE, 0, &p) == FSS_CORRUPT);
+
+  /* 5. Zero cell count invariant violation */
+  memcpy(pageCorrupt, page, PAGE_SIZE);
+  pageCorrupt[4] = 0x00;
+  pageCorrupt[5] = 0x00;
+  assert(fssPageParse(pageCorrupt, PAGE_SIZE, 0, &p) == FSS_CORRUPT);
+
+  /* 6. cell_count > capacity */
+  memcpy(pageCorrupt, page, PAGE_SIZE);
+  pageCorrupt[4] = 0xFF;
+  pageCorrupt[5] = 0xFF;
+  assert(fssPageParse(pageCorrupt, PAGE_SIZE, 0, &p) == FSS_CORRUPT);
+
+  /* 7. Zero capacity */
+  memcpy(pageCorrupt, page, PAGE_SIZE);
+  pageCorrupt[6] = 0x00;
+  pageCorrupt[7] = 0x00;
+  assert(fssPageParse(pageCorrupt, PAGE_SIZE, 0, &p) == FSS_CORRUPT);
+
+  /* 8. Reserved non-zero */
+  memcpy(pageCorrupt, page, PAGE_SIZE);
+  pageCorrupt[14] = 0x01;
+  assert(fssPageParse(pageCorrupt, PAGE_SIZE, 0, &p) == FSS_CORRUPT);
+
+  /* 9. Zero column count */
+  memcpy(pageCorrupt, page, PAGE_SIZE);
+  pageCorrupt[16] = 0x00;
+  pageCorrupt[17] = 0x00;
+  assert(fssPageParse(pageCorrupt, PAGE_SIZE, 0, &p) == FSS_CORRUPT);
+
+  /* 10. Too many columns (> FSS_MAX_COLUMNS) */
+  memcpy(pageCorrupt, page, PAGE_SIZE);
+  pageCorrupt[16] = 0x01;
+  pageCorrupt[17] = 0x00; /* 256 columns */
+  assert(fssPageParse(pageCorrupt, PAGE_SIZE, 0, &p) == FSS_CORRUPT);
+
+  /* 11. Corrupted column widths in descriptor */
+  memcpy(pageCorrupt, page, PAGE_SIZE);
+  pageCorrupt[20] = 0x00;
+  pageCorrupt[21] = 0x08; /* INT32 declared with width 8 instead of 4 */
+  assert(fssPageParse(pageCorrupt, PAGE_SIZE, 0, &p) == FSS_CORRUPT);
+
+  /* 12. Non-monotonic / unordered sparse rowids */
+  int rcSparse = fssPageInit(pageCorrupt, PAGE_SIZE, 0, cols, 2, 0, 10, vals);
+  assert(rcSparse == FSS_OK);
+  assert(fssPageParse(pageCorrupt, PAGE_SIZE, 0, &p) == FSS_OK);
+  FssValue vals2[2] = { fssValueInt(456), fssValueFloat(7.89) };
+  assert(fssPageInsert(&p, 20, vals2, 2) == FSS_OK);
+  /* Corrupt sparse rowid array: make rowid 1 smaller than rowid 0 (e.g. 5 instead of 20) */
+  uint8_t *pIdx = p.aRowIndex;
+  pIdx[8] = 0; pIdx[9] = 0; pIdx[10] = 0; pIdx[11] = 0;
+  pIdx[12] = 0; pIdx[13] = 0; pIdx[14] = 0; pIdx[15] = 5;
+  assert(fssPageParse(pageCorrupt, PAGE_SIZE, 0, &p) == FSS_CORRUPT);
+
+  printf("  PASS: test_fss_malformed_and_edge_cases\n");
+}
+
 int main(void) {
   printf("========================================\n");
   printf("Running SQLite FSS Test Suite\n");
@@ -450,6 +608,8 @@ int main(void) {
   test_fss_demotion_in_place();
   test_fss_split_required_on_overflow();
   test_fss_root_page1_offset();
+  test_fss_db_marker();
+  test_fss_malformed_and_edge_cases();
 
   printf("========================================\n");
   printf("ALL TESTS PASSED SUCCESSFULLY!\n");

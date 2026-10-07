@@ -3,7 +3,7 @@
 ## 1. Core Concept
 
 The fundamental idea of this new page format is:
-> **A table data leaf page that defines its schema (field types) exactly once in the page header, followed by 1 or more data rows conforming to that schema.**
+> **A table data leaf page that defines its schema (field types) exactly once in the page header, followed by 1 or more fixed-width data slots conforming to that schema.**
 
 In standard SQLite data leaf pages (`0x0D`), the page structure is agnostic to the column types. Every single row (cell) acts as an independent, dynamically typed tuple that redundantly serializes its own column types, lengths, and null markers using varint serial types:
 
@@ -18,16 +18,17 @@ Standard SQLite Leaf Page (0x0D):
                                         REPEATED FOR EVERY SINGLE ROW IN THE PAGE!
 ```
 
-In the **Fixed-Schema Storage (FSS)** leaf page, this redundancy is eliminated. The column type descriptors are hoisted into a single **In-Page Schema Definition Header**. Individual data rows contain **only raw column payload data** (plus rowid and an optional null bitmask):
+In the **Fixed-Schema Storage (FSS)** leaf page, this redundancy is eliminated. The column type descriptors are hoisted into a single **In-Page Schema Definition Header**. Rowids are stored separately in a shared rowid index. Individual data slots contain only raw column payload data and an optional null bitmask:
 
 ```
 FSS Leaf Page (0x0E):
 +-----------------------------------------------------------------------------------+
-| Page Header | Field Types Def (ONCE) | Row Index / Cell Ptrs | Data Rows (1..N)   |
-| (16 bytes)  | [col0, col1, col2...]  | [rowid0, rowid1...]   | [Row 0][Row 1]...  |
+| Page Header | Field Types Def (ONCE) | Rowid Index | Fixed-Width Data Slots (1..N) |
+| (16 bytes)  | [col0, col1, col2...]  | [rowid0,...] | [Slot 0][Slot 1]...           |
 +-----------------------------------------------------------------------------------+
-  Where each row contains ONLY:
-  [rowid | (optional null bitmask) | col0_val | col1_val | col2_val ...]
+  Rowids live in the shared rowid index (or as one min_rowid in dense mode).
+  Each data slot contains ONLY:
+  [(optional null bitmask) | col0_val | col1_val | col2_val ...]
   --> Zero serial type bytes per row!
   --> Zero header length varints per row!
 ```
@@ -40,22 +41,22 @@ FSS Leaf Page (0x0E):
    - The page remains self-describing: readers can decode every row on the page using solely the field descriptor stored in that page's preamble, without querying the master schema catalog for every cell.
    - Disk space and memory bandwidth consumption drop significantly (saving 2–8+ bytes of metadata *per row*).
 2. **Predictable Row Size & Direct Offset Math:**
-   - If all columns are fixed-width, row size is constant and mathematically predetermined:
-     $$\text{RowSize} = \text{sizeof}(\text{rowid}) + \lceil N_{\text{cols}} / 8 \rceil + \sum_{i=0}^{N-1} \text{width}(\text{col}_i)$$
-   - Column $k$ in Row $j$ can be accessed with $O(1)$ pointer arithmetic:
-     $$\text{ColOffset}(j, k) = \text{DataStart} + (j \times \text{RowSize}) + \text{ColRelativeOffset}(k)$$
+   - If all columns are fixed-width, row payload size is constant and mathematically predetermined:
+     $$\text{RowPayloadSize} = \text{nullBytes} + \sum_{i=0}^{N-1} \text{width}(\text{col}_i)$$
+   - Column $k$ in slot $j$ can be accessed with $O(1)$ pointer arithmetic:
+     $$\text{ColOffset}(j, k) = \text{DataStart} + (j \times \text{RowPayloadSize}) + \text{ColRelativeOffset}(k)$$
 3. **Strict Minimum Invariant (1 or More Rows):**
    - An FSS page/chunk must always contain at least one data row ($1 \le N \le \text{capacity}$). An FSS chunk is never instantiated empty; it is created upon insertion of its first record. If deletions reduce the row count to zero ($N=0$), the page is freed/reclaimed or merged into sibling pages.
 4. **SIMD & Vectorization Friendly:**
    - With known field offsets across rows, vectorized column filtering (e.g., comparing 8 integers at once using AVX2/NEON) becomes possible directly over page data.
-5. **Zero Defragmentation Needed (for Fixed Widths):**
-   - Deleted rows can be tracked via an allocation bitmask (tombstones). New inserts reuse dead slots in $O(1)$ without memory compaction or freeblock traversal.
+5. **No Variable-Cell Defragmentation (for Fixed Widths):**
+   - Rows occupy fixed-width slots and there are no freeblock chains. Inserts and deletes that are not at the end shift rowids and slots together to preserve key order.
 
 ---
 
 ## 3. Detailed Page Layout Specification
 
-A page of size $P$ (typically 4096 bytes) is organized into four main sections from top to bottom:
+A usable page region of size $P$ (typically 4096 bytes, excluding any SQLite reserved tail) is organized into four main sections from top to bottom:
 
 ```
 Offset 0x00
@@ -70,8 +71,7 @@ Offset 0x00
 |    - Array of Column Descriptors: [Type ID, Byte Width, Flags]        |
 +-----------------------------------------------------------------------+
 | 3. Row Index / Addressing Section                                     |
-|    - Allocation/Tombstone bitmask (1 bit per slot)                    |
-|    - Rowid lookup array: [rowid_0, rowid_1, ... rowid_{N-1}]          |
+|    - Rowid lookup array (or min_rowid in dense mode)                  |
 +-----------------------------------------------------------------------+
 | 4. Data Rows Section (1 to N records)                                 |
 |    - Row 0: [Null Mask (opt) | Field 0 Data | Field 1 Data | ...]     |
@@ -88,20 +88,24 @@ Offset P
 
 ## 4. Binary Specification
 
+### 4.0 Database Compatibility Marker
+
+The FSS SQLite fork owns a versioned file format. When the first FSS leaf is committed, bytes 72–79 of SQLite's 100-byte database header are reserved for this marker: ASCII `FSS1` followed by a 32-bit big-endian FSS format version (`1`). Files without this marker remain ordinary SQLite databases. The matching fork must reject an unknown FSS signature or version before traversing B-tree pages. A build that does not recognize page type `0x0E` is incompatible with marked files. This marker versions the FSS layout independently of SQLite's upstream release number.
+
 ### 4.1 FSS Page Header (16 Bytes)
 
-Located at byte `0x00` of the page (or byte 100 on page 1 of the SQLite database file):
+Located at byte `hdrOffset` of the page (`hdrOffset` is normally 0, or 100 when the SQLite database header occupies page 1). All multi-byte header, descriptor, rowid-index, and numeric values are stored big-endian. Stored offsets are relative to `hdrOffset`.
 
 | Offset | Type | Field Name | Description |
 |---|---|---|---|
 | `0x00` | `uint8` | `page_type` | Page identifier flag: `0x0E` (FSS Table Leaf). |
-| `0x01` | `uint8` | `flags` | Page flags: <br>• Bit 0: Dense sequential rowids (`min_rowid` mode)<br>• Bit 1: Nullable columns present<br>• Bit 2: Variable-length tail arena present |
+| `0x01` | `uint8` | `flags` | Page flags: <br>• Bit 0: Dense sequential rowids (`min_rowid` mode)<br>• Bit 1: Every data slot has a null bitmask<br>• Bit 2: Reserved; unsupported in format version 1 |
 | `0x02` | `uint16` | `schema_version` | Schema version/generation ID. |
 | `0x04` | `uint16` | `cell_count` | Number of active data rows currently in page ($1 \le N \le \text{capacity}$). |
 | `0x06` | `uint16` | `capacity` | Maximum number of rows this page can hold. |
 | `0x08` | `uint16` | `row_payload_size` | Fixed byte length of each raw data row payload. |
-| `0x0A` | `uint16` | `field_desc_offset` | Byte offset to the Field Type Descriptor section (e.g., `0x0010`). |
-| `0x0C` | `uint16` | `data_area_offset` | Byte offset to where Data Rows begin. |
+| `0x0A` | `uint16` | `field_desc_offset` | Byte offset to the Field Type Descriptor section (version 1 writes `0x0010`). |
+| `0x0C` | `uint16` | `data_area_offset` | Byte offset to where fixed-width data slots begin. |
 | `0x0E` | `uint16` | `reserved` | 2 bytes reserved for future flags / 4-byte alignment. |
 
 ### 4.2 Field Type Descriptor (Stored ONCE)
@@ -126,7 +130,7 @@ struct PageSchemaHeader {
 | `type_id` | Name | Fixed Width | Description |
 |---|---|---|---|
 | `0x01` | `INT8` / `BOOL` | 1 byte | Signed 8-bit integer or boolean |
-| `0x02` | `INT16` | 2 bytes | Signed 16-bit integer (little/big-endian) |
+| `0x02` | `INT16` | 2 bytes | Signed 16-bit integer (big-endian, two's complement) |
 | `0x03` | `INT32` | 4 bytes | Signed 32-bit integer |
 | `0x04` | `INT64` | 8 bytes | Signed 64-bit integer |
 | `0x05` | `FLOAT32` | 4 bytes | IEEE 754 single precision float |
@@ -134,25 +138,28 @@ struct PageSchemaHeader {
 | `0x07` | `FIXED_BLOB` | $K$ bytes | Fixed-length byte string/array of length $K$ |
 | `0x08` | `TIMESTAMP_US` | 8 bytes | Microsecond 64-bit Unix timestamp |
 
-> **Note on Variable-Length Fields:**
-> For variable-length strings/blobs (`TEXT`), the field descriptor stores `type_id = 0x09 (VAR_REF)` with fixed `byte_width = 4` (2-byte relative page offset + 2-byte length pointing to an in-page string arena).
+Version 1 stores integers in big-endian two's-complement form, floats as big-endian IEEE-754 bit patterns, and fixed blobs as raw bytes. `FSS_TYPE_VAR_REF` reserves a 4-byte `(offset,length)` reference, but the variable-length arena is not implemented. `FSS_FLAG_VAR_ARENA` and `FSS_TYPE_TEXT` are not supported for active version 1 rows.
 
 ### 4.3 Row Addressing & Indexing
 
-To support SQLite's B-tree search by `int64 rowid`, rowids are tracked in a dedicated index array preceding the data rows:
+FSS removes SQLite's 2-byte-per-row cell-offset table. It does not store a byte offset for each row: slot `j` is always at `data_area_offset + j * row_payload_size`. To support SQLite's B-tree search by `int64 rowid`, FSS keeps a rowid index (or only `min_rowid` in dense mode) before the slots. This index stores keys, not cell offsets. Rowids are signed 64-bit big-endian values, separate from the data payload, and are not included in `row_payload_size`.
+
+The rowid index and data slots stay in the same sorted order. Inserting or deleting a sparse row may shift later rowids and fixed-width slots; this preserves direct slot addressing without SQLite's cell-offset table.
 
 1. **Sequential/Dense Mode (`flags & 0x01`):**
    - Used when rowids are contiguous ($R, R+1, R+2, \dots$).
    - Stores only `int64 min_rowid` (8 bytes).
    - Finding row with `rowid`: $\text{slot\_idx} = \text{rowid} - \text{min\_rowid}$. Lookup is $O(1)$.
 2. **Sparse/General Mode:**
-   - Stores an array of `int64 rowids[capacity]` sorted in ascending order.
+   - Reserves `capacity` entries, each an 8-byte signed rowid, sorted in ascending order; unused entries are zero-filled.
    - Finding row with `rowid`: Binary search over the contiguous 8-byte array.
-   - SIMD-accelerated branchless binary search scans 4 or 8 rowids per instruction.
+   - Lookup uses binary search. SIMD lookup is a possible future optimization, not part of the current helpers.
+
+Dense mode is valid only while rowids form a contiguous ascending run. A gap insertion converts the page to sparse mode if its rows fit that layout. A middle-row deletion also converts to sparse mode, omitting the deleted slot. If the resulting rows cannot fit the sparse layout, the helper returns `FSS_FULL` and the B-tree layer must rebalance or use standard SQLite pages. Dense mode is not automatically re-enabled after conversion.
 
 ### 4.4 Data Row Structure (1 or More Rows)
 
-Every active FSS page maintains the invariant:
+Every valid on-disk FSS page maintains the invariant:
 $$1 \le \text{cell\_count} \le \text{capacity}$$
 An FSS chunk is never instantiated with 0 rows. Each active slot $j$ contains:
 
@@ -163,12 +170,30 @@ An FSS chunk is never instantiated with 0 rows. Each active slot $j$ contains:
 ```
 
 1. **Null Bitmask:**
-   - If any column in the Field Descriptor allows `NULL`s, a bitmask of $\lceil N_{\text{cols}} / 8 \rceil$ bytes is prepended to each row.
-   - Bit $k = 1$ indicates column $k$ is `NULL` (data bytes for column $k$ are ignored/zeroed).
-   - If all columns are defined as `NOT NULL`, this bitmask is **completely omitted** (0 bytes overhead).
+   - If `FSS_FLAG_NULLABLE` is set, a bitmask of $\lceil N_{\text{cols}} / 8 \rceil$ bytes is prepended to every slot. This page-wide flag allocates the mask; each column's `NOT NULL` descriptor flag controls whether it may be NULL.
+   - Bit `(k / 8, k % 8)` set to 1 indicates column $k$ is `NULL` (least-significant-bit-first within each byte; data bytes are ignored/zeroed).
+   - If no column may be NULL, `FSS_FLAG_NULLABLE` is clear and the bitmask is **omitted** (0 bytes overhead).
 2. **Field Data:**
    - Column values are stored directly in binary form at their fixed offsets.
    - **No serial types, no varints, no per-row column counts.**
+
+### 4.5 Version 1 Schema Eligibility and Mapping
+
+FSS version 1 applies only to ordinary rowid tables whose stored columns all map to supported fixed-width descriptors. `WITHOUT ROWID` tables, virtual tables, generated/hidden columns, and tables containing unsupported declarations use standard SQLite pages.
+
+Declared type names are matched case-insensitively after trimming surrounding whitespace:
+
+| Declared type | FSS descriptor |
+|---|---|
+| `INT8`, `BOOL`, `BOOLEAN` | `INT8` (1 byte) |
+| `INT16` | `INT16` (2 bytes) |
+| `INT32` | `INT32` (4 bytes) |
+| `INT`, `INTEGER`, `BIGINT`, `INT64` | `INT64` (8 bytes) |
+| `FLOAT64`, `DOUBLE`, `REAL` | `FLOAT64` (8 bytes) |
+| `TIMESTAMP_US` | `TIMESTAMP_US` (8 bytes) |
+| `BLOB(K)` where K is a positive fixed integer | `FIXED_BLOB` (K bytes) |
+
+Other declarations, including unbounded `TEXT`, `BLOB`, `NUMERIC`, and `FLOAT32`, are not eligible in version 1. An `INTEGER PRIMARY KEY` rowid alias is also ineligible until its implicit column semantics are explicitly mapped; the rowid is stored in the FSS rowid index, while SQLite normally synthesizes the alias value rather than storing it in the record payload. `NOT NULL` maps to `FSS_COL_FLAG_NOT_NULL`; otherwise the column is nullable. The page-wide null mask is allocated if any stored column is nullable. SQLite affinity and runtime values still apply: a value that cannot be represented without changing SQLite-visible value semantics must use the standard-page fallback.
 
 ---
 
@@ -181,15 +206,17 @@ An FSS page is allocated and formatted upon insertion of its first data row:
 3. Schema written to `PageSchemaHeader`: number of columns and column type descriptors.
 4. `row_payload_size` calculated as:
    $$\text{row\_payload\_size} = \text{null\_bytes} + \sum_{i=0}^{num\_cols-1} col\_width_i$$
-5. `capacity` calculated based on remaining space:
-   $$\text{capacity} = \left\lfloor \frac{P - \text{data\_area\_offset}}{\text{sizeof(rowid)} + \text{row\_payload\_size}} \right\rfloor$$
-6. Initial row ($N=1$) is written: rowid placed in slot 0, and column values written to data slot 0.
+5. Let `D = 16 + 2 + 4 * num_cols` be the descriptor end relative to `hdrOffset`, `H` be `hdrOffset`, and `R` be `row_payload_size`:
+   - Dense: `capacity = floor((P - H - D - 8) / R)`; the 8-byte index stores `min_rowid` and `data_area_offset = D + 8`.
+   - Sparse: `capacity = floor((P - H - D) / (8 + R))`; each rowid uses 8 bytes and `data_area_offset = D + 8 * capacity`.
+   - `data_area_offset` is relative to `hdrOffset` in both modes.
+6. Initial row ($N=1$) is written: rowid goes in the rowid index and column values go in data slot 0.
 7. Set `cell_count = 1`. Page is now active and compliant with the $\ge 1$ row invariant.
 
 ### 5.2 Inserting Subsequent Rows ($1 \rightarrow N$)
 1. Check if `cell_count < capacity`. (If full, trigger standard B-tree leaf split).
 2. Find insertion index for `new_rowid` to maintain sorted rowid order.
-3. If necessary, shift rowid entries and data slots, or append to slot and update index.
+3. If necessary, shift rowid entries and data slots together, or append when inserting at the end.
 4. Copy column values into the target data slot.
 5. Increment `cell_count`.
 
@@ -217,11 +244,12 @@ An FSS page is allocated and formatted upon insertion of its first data row:
 
 ### 5.5 Deleting a Row & Chunk Teardown
 - **When $\text{cell\_count} > 1$:**
-  - Option A: Clear bit in slot allocation bitmask, decrement `cell_count` ($O(1)$ tombstone).
-  - Option B: Shift subsequent slots and decrement `cell_count` (compact layout, maintains zero fragmentation).
+  - Find the rowid's slot, shift later sparse rowids and data slots left, clear the final rowid/slot, and decrement `cell_count`. There is no tombstone bitmap.
 - **When $\text{cell\_count} == 1$ (Deleting the Final Row):**
   - Because an FSS chunk must strictly contain 1 or more data rows, deleting the sole remaining row underflows the chunk.
   - The page is **freed/reclaimed** to SQLite's pager freelist (or merged with an adjacent sibling page), and the pointer is removed from the parent interior node (`0x05`). An FSS chunk never persists with 0 rows.
+
+The standalone helper converts a dense page to sparse mode for a middle-row deletion when the remaining rows fit. Deleting the final row returns `FSS_UNDERFLOW`; the caller must reclaim the page.
 
 ---
 
@@ -339,11 +367,12 @@ CREATE TABLE sensor_readings (
 - **Per-Row Payload:**
   - Null mask: 0 bytes (all `NOT NULL`).
   - Data: $4 + 8 + 2 = 14$ bytes.
-  - RowID: 8 bytes.
-  - *Total per row:* $14 + 8 = 22$ bytes.
+  - Sparse rowid index entry: 8 bytes per row (stored separately from the data slot).
+  - Data slot: 14 bytes.
 - **Page Capacity:**
-  - Available space: $4096 - 16 - 14 = 4066$ bytes.
-  - $\lfloor 4066 / 22 \rfloor = \mathbf{184\text{ rows per page}}$.
+  - Descriptor end relative to the page header: $16 + 2 + (3 \times 4) = 30$ bytes.
+  - Sparse mode: $\lfloor (4096 - 30) / (8 + 14) \rfloor = \mathbf{184\text{ rows per page}}$.
+  - Dense mode: $\lfloor (4096 - 30 - 8) / 14 \rfloor = \mathbf{289\text{ rows per page}}$; the 8-byte min-rowid index covers the whole page.
 
 ### Comparison with Standard SQLite `0x0D` Page:
 - Standard row overhead:
@@ -370,7 +399,7 @@ CREATE TABLE sensor_readings (
 | **Cell Addressing** | 2-byte cell pointer array + variable cell offsets | Direct arithmetic / packed rowid array |
 | **Column Projection** | Sequential scan of varints to reach col $N$ | Direct offset: $O(1)$ pointer math |
 | **NULL Overhead** | 1 byte per column in record header | 1 bit per column (or 0 if `NOT NULL`) |
-| **Fragmentation** | Freeblocks + fragmented byte tracking | Bitmap tombstones; zero fragmentation |
+| **Fragmentation** | Freeblocks + fragmented byte tracking | Fixed slots; ordered inserts/deletes may shift rows |
 | **Type Mismatch** | Native (accepts any type) | Morphs in-place to `0x0D` or splits into new node |
 | **SIMD / Vectorization** | Not feasible (variable cell layout) | Native support (contiguous fixed arrays) |
 

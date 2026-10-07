@@ -21,9 +21,9 @@ For a table with 6 columns, standard SQLite burns **10 to 18 bytes of pure metad
 #### How FSS Achieves Smaller File Sizes:
 - **Schema Stored Once:** The field types, byte widths, and nullability flags are written exactly once in the page preamble (~14–20 bytes total for the whole 4KB page).
 - **Zero Per-Row Serial Types:** Individual rows contain only raw binary data values (plus an optional null bitmask).
-- **Elimination of the Row Offset Table (Cell Pointer Array):** Standard SQLite allocates a 2-byte integer offset (`aCellIdx`) for every single row at the top of the page. Because FSS rows have a fixed, identical payload size, this entire table is removed. The byte location of row $i$ is calculated directly via $O(1)$ pointer arithmetic:
-  $$\text{RowOffset}(i) = \text{DataAreaOffset} + (i \times \text{RowSize})$$
-  This instantly saves **2 bytes per row** on disk and eliminates cell pointer array shifting on inserts and deletes.
+- **Elimination of the Row Offset Table (Cell Pointer Array):** Standard SQLite allocates a 2-byte integer offset (`aCellIdx`) for every row at the top of the page. FSS removes that table. It keeps rowids for B-tree key lookup, but stores no per-row byte offsets. Because FSS rows have a fixed, identical payload size, the byte location of row $i$ is calculated directly via $O(1)$ pointer arithmetic:
+  $$\text{RowOffset}(i) = \text{DataAreaOffset} + (i \times \text{RowPayloadSize})$$
+  This removes SQLite's **2-byte cell-pointer entry per row**. FSS rowid-index bytes are accounted separately and affect the net storage savings.
 - **Storage Savings:** Databases storing structured or time-series data typically achieve a **20% to 35%+ reduction in total database file size**.
 
 | Scenario (4096-Byte Page) | Standard SQLite (`0x0D`) | Fixed-Schema Leaf (`0x0E`) | Savings |
@@ -45,14 +45,14 @@ The reduction in file size and adoption of fixed-size slots unlock substantial p
 #### ⚡ 2.2 $O(1)$ Direct Memory Addressing (No Varint Scanning)
 - In standard SQLite, extracting column $N$ requires looping through the first $N-1$ variable-length serial types in the record header to compute the byte offset.
 - In FSS, every column offset is known statically. Reading column $k$ of row $j$ is computed in **$O(1)$ pointer arithmetic**:
-  $$\text{Offset} = \text{DataAreaStart} + (j \times \text{RowSize}) + \text{ColOffset}[k]$$
+  $$\text{Offset} = \text{DataAreaStart} + (j \times \text{RowPayloadSize}) + \text{ColOffset}[k]$$
 
 #### ⚡ 2.3 SIMD & Vectorized Query Execution
 - Because column data is stored in predictable, contiguous slots across rows, modern CPUs can execute filter scans (`WHERE temperature > 75.0`) using **SIMD instructions (AVX2, AVX-512, ARM NEON)** to evaluate multiple rows per CPU cycle.
 
 #### ⚡ 2.4 Zero In-Page Fragmentation & No Defragmentation Overhead
 - In standard SQLite, deleting or updating variable-sized rows creates fragmented free space and freeblock chains. Periodically, SQLite must run `defragmentPage()` to compact bytes.
-- In FSS, fixed-width slots are managed via an allocation/tombstone bitmask. Deleted slots are reused instantly in $O(1)$ without memory compaction or freeblock traversal.
+- In FSS, fixed-width slots need no freeblock chains or variable-cell defragmentation. Sparse inserts and deletes may shift rowids and slots together to preserve sorted rowid order.
 
 #### ⚡ 2.5 100% Backward Compatibility & Graceful Degradation
 - SQLite allows inserting values of arbitrary types into any column. FSS preserves this guarantee completely:
@@ -73,7 +73,7 @@ The reduction in file size and adoption of fixed-size slots unlock substantial p
 | **Row Offset Table (Cell Pointers)** | 2 bytes per row (`aCellIdx`) | **Eliminated** ($O(1)$ arithmetic calculation) |
 | **Row Count Invariant** | 0 or more cells | **1 or more data rows** |
 | **Column Projection** | $O(N)$ varint traversal per row | **$O(1)$ direct pointer arithmetic** |
-| **Page Defragmentation** | Frequent (`defragmentPage()`) | **None** (slot bitmask tombstones) |
+| **Page Defragmentation** | Freeblock compaction may be needed | No variable-cell freeblocks; ordered insert/delete may shift fixed slots |
 | **Vectorization / SIMD** | Impossible | **Native support** |
 | **Dynamic Type Handling** | Native | **Graceful in-place demotion / split** |
 
@@ -127,15 +127,14 @@ Workload: 10,000 structured IoT/Sensor records with schema `(timestamp INT64, se
 | Metric | Standard SQLite (`0x0D`) | Fixed-Schema Storage (`0x0E`) | Gain / Advantage |
 |---|---|---|---|
 | **Database File Size** | **294,912 bytes** | **253,952 bytes** | **-13.9% SPACE (-40,960 bytes)** |
-| **Total 4KB Pages Allocated** | 72 pages | 62 pages | **-10 pages saved** |
-| **INSERT Throughput** | 3,456,845 ops/sec | 17,632,672 ops/sec | **~5.1x FASTER (direct slot packing)** |
-| **SELECT Point Lookups** | 191,078 queries/sec | 190,787 queries/sec | **Consistent, zero varint overhead** |
-| **UPDATE In-Place Throughput** | 418,725 updates/sec | 29,588,687 updates/sec | **~70x FASTER (direct slot writes)** |
-| **Data Consistency** | 10,000 rows | 10,000 rows | **100% Match Verified** |
+| **Total 4KB Pages Allocated** | 72 pages | 62 pages (60 FSS leaves, 1 interior) | **-10 pages saved** |
+| **INSERT Throughput** | ~3,400,000 ops/sec | ~2,100,000 ops/sec | **0.6x (balanced B-tree FSS integration)** |
+| **SELECT Point Lookups** | ~179,000 queries/sec | ~184,000 queries/sec | **1.03x FASTER (direct slot math, zero varint overhead)** |
+| **UPDATE In-Place Throughput** | ~3,200,000 updates/sec | ~2,000,000 updates/sec | **0.6x (in-place slot updates with index preservation)** |
+| **Data Consistency** | 10,000 rows | 10,000 rows | **100% Match Verified (integrity_check ok)** |
 
 ---
 
 ## 📖 Detailed Specification
 
 For complete binary layout offsets, header field structures, and demotion state-machine details, see [DESIGN.md](file:///home/boris/projects/sqlite-fss/DESIGN.md).
-

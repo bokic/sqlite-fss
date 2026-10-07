@@ -79,110 +79,6 @@ static void format_interior_root_page(uint8_t *page, int numLeaves, int cap, int
   putU32(&page[8], (uint32_t)(3 + numLeaves - 1)); /* Right child pointer */
 }
 
-/*
-** Build FSS database with 10,000 rows and measure row insertion time
-*/
-static double populate_fss_database(const char *dbPath) {
-  remove(dbPath);
-
-  /* Step 1: Pre-initialize sqlite schema (outside timed insertion, just like Standard SQLite) */
-  sqlite3 *db;
-  int rc = sqlite3_open(dbPath, &db);
-  assert(rc == SQLITE_OK);
-
-  rc = sqlite3_exec(db, "PRAGMA page_size = 4096;", NULL, NULL, NULL);
-  assert(rc == SQLITE_OK);
-
-  rc = sqlite3_exec(db,
-    "CREATE TABLE sensor_readings(timestamp INT NOT NULL, sensor_id INT NOT NULL, reading DOUBLE NOT NULL, status INT NOT NULL);",
-    NULL, NULL, NULL
-  );
-  assert(rc == SQLITE_OK);
-  sqlite3_close(db);
-
-  /* Step 2: Open file and prepare pages */
-  FILE *f = fopen(dbPath, "r+b");
-  assert(f != NULL);
-
-  FssFieldDesc cols[4] = {
-    { FSS_TYPE_INT64, FSS_COL_FLAG_NOT_NULL, 8 },
-    { FSS_TYPE_INT32, FSS_COL_FLAG_NOT_NULL, 4 },
-    { FSS_TYPE_FLOAT64, FSS_COL_FLAG_NOT_NULL, 8 },
-    { FSS_TYPE_INT32, FSS_COL_FLAG_NOT_NULL, 4 }
-  };
-
-  uint16_t rowPayloadSize, nullBytes;
-  fssCalculateRowSize(cols, 4, FSS_FLAG_DENSE_ROWID, &rowPayloadSize, &nullBytes);
-  uint16_t cap = fssCalculateCapacity(PAGE_SIZE, 0, 4, rowPayloadSize, FSS_FLAG_DENSE_ROWID);
-  int numLeaves = (NUM_ROWS + cap - 1) / cap;
-
-  /* Format interior root page */
-  uint8_t rootBuf[PAGE_SIZE];
-  format_interior_root_page(rootBuf, numLeaves, cap, NUM_ROWS);
-
-  uint8_t *leafPages = (uint8_t *)malloc(numLeaves * PAGE_SIZE);
-  assert(leafPages != NULL);
-
-  /* Time the row insertion / page population */
-  double t0 = get_time_sec();
-  for (int p = 0; p < numLeaves; p++) {
-    int startRow = p * cap + 1;
-    int rowsOnThisPage = (p == numLeaves - 1) ? (NUM_ROWS - startRow + 1) : cap;
-
-    /* Initial row */
-    int64_t ts = 1728123000000LL + (int64_t)startRow * 1000LL;
-    int sensor_id = 100000 + (startRow % 250);
-    double reading = 20.0 + (startRow % 100) * 0.25;
-    int status = 50000 + (startRow % 10);
-
-    FssValue vals[4];
-    vals[0] = fssValueInt(ts);
-    vals[1] = fssValueInt(sensor_id);
-    vals[2] = fssValueFloat(reading);
-    vals[3] = fssValueInt(status);
-
-    uint8_t *pageBuf = leafPages + p * PAGE_SIZE;
-    rc = fssPageInit(pageBuf, PAGE_SIZE, 0, cols, 4, FSS_FLAG_DENSE_ROWID, startRow, vals);
-    assert(rc == FSS_OK);
-
-    FssPage page;
-    fssPageParse(pageBuf, PAGE_SIZE, 0, &page);
-
-    for (int j = 1; j < rowsOnThisPage; j++) {
-      int rid = startRow + j;
-      vals[0] = fssValueInt(1728123000000LL + (int64_t)rid * 1000LL);
-      vals[1] = fssValueInt(100000 + (rid % 250));
-      vals[2] = fssValueFloat(20.0 + (rid % 100) * 0.25);
-      vals[3] = fssValueInt(50000 + (rid % 10));
-
-      rc = fssPageInsert(&page, rid, vals, 4);
-      assert(rc == FSS_OK);
-    }
-  }
-  double fssInsertTime = get_time_sec() - t0;
-
-  /* Flush pages to database file */
-  fseek(f, 4096, SEEK_SET);
-  fwrite(rootBuf, 1, PAGE_SIZE, f);
-
-  for (int p = 0; p < numLeaves; p++) {
-    long offset = (long)(3 + p - 1) * PAGE_SIZE;
-    fseek(f, offset, SEEK_SET);
-    fwrite(leafPages + p * PAGE_SIZE, 1, PAGE_SIZE, f);
-  }
-
-  /* Update database page count in file header (offset 28) */
-  uint8_t pCountBuf[4];
-  putU32(pCountBuf, (uint32_t)(2 + numLeaves));
-  fseek(f, 28, SEEK_SET);
-  fwrite(pCountBuf, 1, 4, f);
-
-  free(leafPages);
-  fclose(f);
-
-  return fssInsertTime;
-}
-
 int main(void) {
   printf("=======================================================================\n");
   printf(" SQLite Fixed-Schema Storage (FSS) vs Standard SQLite Benchmark\n");
@@ -202,14 +98,53 @@ int main(void) {
   ** ------------------------------------------------------------------------- */
   printf("[1/4] Benchmarking %d INSERT operations...\n", NUM_ROWS);
 
+  /* Benchmark FSS INSERT */
+  int rc = sqlite3_open(fssDbPath, &dbFss);
+  assert(rc == SQLITE_OK);
+  sqlite3_exec(dbFss, "PRAGMA page_size = 4096;", NULL, NULL, NULL);
+  sqlite3_exec(dbFss, "PRAGMA synchronous = OFF;", NULL, NULL, NULL);
+  sqlite3_exec(dbFss, "PRAGMA journal_mode = MEMORY;", NULL, NULL, NULL);
+  rc = sqlite3_exec(dbFss, "PRAGMA fixed_schema = ON;", NULL, NULL, NULL);
+  assert(rc == SQLITE_OK);
+
+  sqlite3_exec(dbFss,
+    "CREATE TABLE sensor_readings(timestamp INT64 NOT NULL, sensor_id INT32 NOT NULL, reading DOUBLE NOT NULL, status INT32 NOT NULL);",
+    NULL, NULL, NULL
+  );
+
+  sqlite3_stmt *stmtInsertFss;
+  rc = sqlite3_prepare_v2(dbFss,
+    "INSERT INTO sensor_readings(rowid, timestamp, sensor_id, reading, status) VALUES (?, ?, ?, ?, ?);",
+    -1, &stmtInsertFss, NULL
+  );
+  assert(rc == SQLITE_OK);
+
+  sqlite3_exec(dbFss, "BEGIN TRANSACTION;", NULL, NULL, NULL);
+  double t1 = get_time_sec();
+  for (int i = 1; i <= NUM_ROWS; i++) {
+    sqlite3_bind_int64(stmtInsertFss, 1, i);
+    sqlite3_bind_int64(stmtInsertFss, 2, 1728123000000LL + (int64_t)i * 1000LL);
+    sqlite3_bind_int(stmtInsertFss, 3, 100000 + (i % 250));
+    sqlite3_bind_double(stmtInsertFss, 4, 20.0 + (i % 100) * 0.25);
+    sqlite3_bind_int(stmtInsertFss, 5, 50000 + (i % 10));
+    sqlite3_step(stmtInsertFss);
+    sqlite3_reset(stmtInsertFss);
+  }
+  sqlite3_exec(dbFss, "COMMIT;", NULL, NULL, NULL);
+  double fssInsertTime = get_time_sec() - t1;
+  sqlite3_finalize(stmtInsertFss);
+  sqlite3_close(dbFss);
+
   /* Benchmark Standard SQLite INSERT */
-  int rc = sqlite3_open(stdDbPath, &dbStd);
+  rc = sqlite3_open(stdDbPath, &dbStd);
   assert(rc == SQLITE_OK);
   sqlite3_exec(dbStd, "PRAGMA page_size = 4096;", NULL, NULL, NULL);
   sqlite3_exec(dbStd, "PRAGMA synchronous = OFF;", NULL, NULL, NULL);
   sqlite3_exec(dbStd, "PRAGMA journal_mode = MEMORY;", NULL, NULL, NULL);
+  rc = sqlite3_exec(dbStd, "PRAGMA fixed_schema = OFF;", NULL, NULL, NULL);
+  assert(rc == SQLITE_OK);
   sqlite3_exec(dbStd,
-    "CREATE TABLE sensor_readings(timestamp INT NOT NULL, sensor_id INT NOT NULL, reading DOUBLE NOT NULL, status INT NOT NULL);",
+    "CREATE TABLE sensor_readings(timestamp INT64 NOT NULL, sensor_id INT32 NOT NULL, reading DOUBLE NOT NULL, status INT32 NOT NULL);",
     NULL, NULL, NULL
   );
 
@@ -236,9 +171,6 @@ int main(void) {
   sqlite3_finalize(stmtInsertStd);
   sqlite3_close(dbStd);
 
-  /* Benchmark FSS INSERT */
-  double fssInsertTime = populate_fss_database(fssDbPath);
-
   printf("  -> Standard SQLite: %.4f s (%ld ops/sec)\n",
          stdInsertTime, (long)(NUM_ROWS / stdInsertTime));
   printf("  -> FSS Storage:     %.4f s (%ld ops/sec) [%.1fx speedup]\n\n",
@@ -256,9 +188,26 @@ int main(void) {
 
   printf("  -> Standard SQLite DB: %10ld bytes (%ld pages)\n", stdSize, stdPages);
   printf("  -> FSS Leaf Storage DB: %10ld bytes (%ld pages)\n", fssSize, fssPages);
-  printf("  -> SPACE SAVINGS:      %10ld bytes (%.2f%% REDUCTION!)\n\n",
+  printf("  -> SPACE SAVINGS:      %10ld bytes (%.2f%% REDUCTION!)\n",
          stdSize - fssSize, savingsPct);
   assert(fssSize < stdSize);
+
+  /* Verify that fss.db actually contains 0x0E table leaf pages */
+  FILE *fFss = fopen(fssDbPath, "rb");
+  assert(fFss != NULL);
+  uint8_t hdrBuf[16];
+  int countFssLeaves = 0;
+  int countInterior = 0;
+  for (int p = 2; p <= fssPages; p++) {
+    fseek(fFss, (long)(p - 1) * PAGE_SIZE, SEEK_SET);
+    assert(fread(hdrBuf, 1, 16, fFss) == 16);
+    if (hdrBuf[0] == 0x0E) countFssLeaves++;
+    else if (hdrBuf[0] == 0x05) countInterior++;
+  }
+  fclose(fFss);
+  printf("  -> Verified actual disk structure: %d FSS leaves (0x0E), %d interior nodes (0x05)\n\n",
+         countFssLeaves, countInterior);
+  assert(countFssLeaves > 0); /* Fail if expected FSS leaves are absent! */
 
   /* -------------------------------------------------------------------------
   ** 3. SELECT BENCHMARK (10,000 Point Lookups + Full Scan)
@@ -310,9 +259,6 @@ int main(void) {
   double fssSelectTime = get_time_sec() - t0;
   sqlite3_finalize(stmtSelectFss);
 
-  sqlite3_close(dbFss);
-  dbFss = NULL;
-
   printf("  -> Standard SQLite: %.4f s (%ld queries/sec)\n",
          stdSelectTime, (long)(NUM_ROWS / stdSelectTime));
   printf("  -> FSS Storage:     %.4f s (%ld queries/sec) [%.1fx speedup]\n\n",
@@ -323,54 +269,56 @@ int main(void) {
   ** ------------------------------------------------------------------------- */
   printf("[4/4] Benchmarking %d UPDATE operations...\n", NUM_ROWS);
 
-  /* Benchmark Standard SQLite UPDATE */
-  sqlite3_stmt *stmtUpdateStd;
+  /*
+  ** Both implementations run the same prepared SQL UPDATE workload, in one
+  ** transaction. Keep the connection open and check every SQLite result so
+  ** an unsupported or skipped FSS update cannot appear as fast throughput.
+  */
+  assert(sqlite3_exec(dbStd, "PRAGMA synchronous = OFF;", NULL, NULL, NULL) == SQLITE_OK);
+  assert(sqlite3_exec(dbStd, "PRAGMA journal_mode = MEMORY;", NULL, NULL, NULL) == SQLITE_OK);
+  assert(sqlite3_exec(dbFss, "PRAGMA synchronous = OFF;", NULL, NULL, NULL) == SQLITE_OK);
+  assert(sqlite3_exec(dbFss, "PRAGMA journal_mode = MEMORY;", NULL, NULL, NULL) == SQLITE_OK);
+
+  sqlite3_stmt *stmtUpdateStd = NULL;
   rc = sqlite3_prepare_v2(dbStd,
     "UPDATE sensor_readings SET reading = reading + 1.0 WHERE rowid = ?;",
     -1, &stmtUpdateStd, NULL
   );
   assert(rc == SQLITE_OK);
+  sqlite3_stmt *stmtUpdateFss = NULL;
+  rc = sqlite3_prepare_v2(dbFss,
+    "UPDATE sensor_readings SET reading = reading + 1.0 WHERE rowid = ?;",
+    -1, &stmtUpdateFss, NULL
+  );
+  assert(rc == SQLITE_OK);
 
-  sqlite3_exec(dbStd, "BEGIN TRANSACTION;", NULL, NULL, NULL);
+  rc = sqlite3_exec(dbStd, "BEGIN TRANSACTION;", NULL, NULL, NULL);
+  assert(rc == SQLITE_OK);
   t0 = get_time_sec();
   for (int i = 1; i <= NUM_ROWS; i++) {
-    sqlite3_bind_int64(stmtUpdateStd, 1, i);
-    sqlite3_step(stmtUpdateStd);
-    sqlite3_reset(stmtUpdateStd);
+    assert(sqlite3_bind_int64(stmtUpdateStd, 1, i) == SQLITE_OK);
+    rc = sqlite3_step(stmtUpdateStd);
+    assert(rc == SQLITE_DONE);
+    assert(sqlite3_changes(dbStd) == 1);
+    assert(sqlite3_reset(stmtUpdateStd) == SQLITE_OK);
   }
-  sqlite3_exec(dbStd, "COMMIT;", NULL, NULL, NULL);
+  assert(sqlite3_exec(dbStd, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK);
   double stdUpdateTime = get_time_sec() - t0;
   sqlite3_finalize(stmtUpdateStd);
 
-  /* Benchmark FSS In-Memory/Page UPDATE */
+  rc = sqlite3_exec(dbFss, "BEGIN TRANSACTION;", NULL, NULL, NULL);
+  assert(rc == SQLITE_OK);
   t0 = get_time_sec();
-  FILE *f = fopen(fssDbPath, "r+b");
-  assert(f != NULL);
-  uint8_t pbuf[PAGE_SIZE];
-  for (int p = 2; p < fssPages; p++) {
-    long offset = (long)p * PAGE_SIZE;
-    fseek(f, offset, SEEK_SET);
-    size_t nr = fread(pbuf, 1, PAGE_SIZE, f);
-    if (nr == PAGE_SIZE && pbuf[0] == 0x0E) {
-      FssPage fpage;
-      fssPageParse(pbuf, PAGE_SIZE, 0, &fpage);
-      for (int s = 0; s < fpage.hdr.cell_count; s++) {
-        FssValue val;
-        fssPageGetColumn(&fpage, s, 2, &val); /* Column 2 is reading */
-        val.u.r += 1.0;
-        fssPageUpdateColumn(&fpage, s, 2, &val);
-      }
-      fseek(f, offset, SEEK_SET);
-      fwrite(pbuf, 1, PAGE_SIZE, f);
-    }
+  for (int i = 1; i <= NUM_ROWS; i++) {
+    assert(sqlite3_bind_int64(stmtUpdateFss, 1, i) == SQLITE_OK);
+    rc = sqlite3_step(stmtUpdateFss);
+    assert(rc == SQLITE_DONE);
+    assert(sqlite3_changes(dbFss) == 1);
+    assert(sqlite3_reset(stmtUpdateFss) == SQLITE_OK);
   }
-  fclose(f);
+  assert(sqlite3_exec(dbFss, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK);
   double fssUpdateTime = get_time_sec() - t0;
-
-  rc = sqlite3_open(fssDbPath, &dbFss);
-  assert(rc == SQLITE_OK);
-  rc = sqlite3_exec(dbFss, "PRAGMA fixed_schema = ON;", NULL, NULL, NULL);
-  assert(rc == SQLITE_OK);
+  sqlite3_finalize(stmtUpdateFss);
 
   printf("  -> Standard SQLite: %.4f s (%ld updates/sec)\n",
          stdUpdateTime, (long)(NUM_ROWS / stdUpdateTime));

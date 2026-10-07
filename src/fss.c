@@ -48,22 +48,6 @@ static inline void fssPutU32(uint8_t *p, uint32_t v) {
   p[3] = (uint8_t)(v & 0xff);
 }
 
-static inline int64_t fssGetI64(const uint8_t *p) {
-  uint64_t v = 0;
-  for( int i = 0; i < 8; i++ ){
-    v = (v << 8) | (uint64_t)p[i];
-  }
-  return (int64_t)v;
-}
-
-static inline void fssPutI64(uint8_t *p, int64_t v) {
-  uint64_t uv = (uint64_t)v;
-  for( int i = 7; i >= 0; i-- ){
-    p[i] = (uint8_t)(uv & 0xff);
-    uv >>= 8;
-  }
-}
-
 static inline float fssGetF32(const uint8_t *p) {
   uint32_t u = fssGetU32(p);
   float f;
@@ -78,7 +62,8 @@ static inline void fssPutF32(uint8_t *p, float f) {
 }
 
 static inline double fssGetF64(const uint8_t *p) {
-  uint64_t u = (uint64_t)fssGetI64(p);
+  uint64_t u = 0;
+  for( int i = 0; i < 8; i++ ) u = (u << 8) | p[i];
   double d;
   memcpy(&d, &u, sizeof(d));
   return d;
@@ -87,7 +72,10 @@ static inline double fssGetF64(const uint8_t *p) {
 static inline void fssPutF64(uint8_t *p, double d) {
   uint64_t u;
   memcpy(&u, &d, sizeof(u));
-  fssPutI64(p, (int64_t)u);
+  for( int i = 7; i >= 0; i-- ){
+    p[i] = (uint8_t)(u & 0xff);
+    u >>= 8;
+  }
 }
 
 /*
@@ -169,6 +157,115 @@ int fssVarintLen(uint64_t v) {
   return fssPutVarint(buf, v);
 }
 
+static int fssGetVarintBounded(const uint8_t *p, uint32_t n, uint64_t *pv){
+  uint64_t v = 0;
+  if( p == NULL || pv == NULL ) return 0;
+  for( uint32_t i = 0; i < 8; i++ ){
+    if( i >= n ) return 0;
+    v = (v << 7) | (p[i] & 0x7f);
+    if( !(p[i] & 0x80) ){
+      *pv = v;
+      return (int)i + 1;
+    }
+  }
+  if( n < 9 ) return 0;
+  *pv = (v << 8) | p[8];
+  return 9;
+}
+
+static int fssSignExtend(uint64_t u, uint32_t nByte, int64_t *pOut){
+  if( nByte == 0 || nByte > 8 || pOut == NULL ) return 0;
+  if( nByte < 8 && (u & ((uint64_t)1 << (nByte * 8 - 1))) ){
+    u |= UINT64_MAX << (nByte * 8);
+  }
+  if( u <= INT64_MAX ) *pOut = (int64_t)u;
+  else *pOut = -1 - (int64_t)(~u);
+  return 1;
+}
+
+int fssRecordToValues(
+  const uint8_t *pRecord,
+  uint32_t nRecord,
+  FssValue *aValues,
+  uint16_t maxValues,
+  uint16_t *pnValues
+){
+  uint64_t headerSize64;
+  uint32_t headerSize;
+  uint32_t headerLen;
+  uint32_t serialOff;
+  uint32_t dataOff;
+  uint16_t nValues = 0;
+  uint64_t aSerial[FSS_MAX_COLUMNS];
+
+  if( pnValues ) *pnValues = 0;
+  if( pRecord == NULL || nRecord == 0 || pnValues == NULL ) return FSS_ERROR;
+  int nHeaderLen = fssGetVarintBounded(pRecord, nRecord, &headerSize64);
+  if( nHeaderLen == 0 || headerSize64 < (uint64_t)nHeaderLen ||
+      headerSize64 > nRecord ) return FSS_CORRUPT;
+  headerSize = (uint32_t)headerSize64;
+  headerLen = headerSize;
+  serialOff = (uint32_t)nHeaderLen;
+  dataOff = headerSize;
+
+  while( serialOff < headerLen ){
+    uint64_t serial;
+    int n = fssGetVarintBounded(pRecord + serialOff, headerLen - serialOff,
+                                &serial);
+    if( n == 0 || nValues >= FSS_MAX_COLUMNS ) return FSS_CORRUPT;
+    aSerial[nValues++] = serial;
+    serialOff += (uint32_t)n;
+  }
+  if( serialOff != headerLen ) return FSS_CORRUPT;
+  if( nValues > maxValues || (nValues > 0 && aValues == NULL) ) return FSS_FULL;
+
+  for( uint16_t i = 0; i < nValues; i++ ){
+    uint64_t serial = aSerial[i];
+    uint32_t nData = 0;
+    FssValue v;
+    memset(&v, 0, sizeof(v));
+    if( serial == 0 ){
+      v = fssValueNull();
+    }else if( serial >= 1 && serial <= 6 ){
+      static const uint8_t aWidth[] = {0,1,2,3,4,6,8};
+      uint64_t u = 0;
+      nData = aWidth[serial];
+      if( nData > nRecord - dataOff ) return FSS_CORRUPT;
+      for( uint32_t b = 0; b < nData; b++ ) u = (u << 8) | pRecord[dataOff + b];
+      if( !fssSignExtend(u, nData, &v.u.i) ) return FSS_CORRUPT;
+      v.type = nData == 1 ? FSS_TYPE_INT8 :
+               nData == 2 ? FSS_TYPE_INT16 :
+               nData <= 4 ? FSS_TYPE_INT32 : FSS_TYPE_INT64;
+    }else if( serial == 7 ){
+      nData = 8;
+      if( nData > nRecord - dataOff ) return FSS_CORRUPT;
+      v.type = FSS_TYPE_FLOAT64;
+      v.u.r = fssGetF64(pRecord + dataOff);
+    }else if( serial == 8 || serial == 9 ){
+      v.type = FSS_TYPE_INT64;
+      v.u.i = serial == 8 ? 0 : 1;
+    }else if( serial == 10 || serial == 11 ){
+      return FSS_CORRUPT;
+    }else if( serial >= 12 ){
+      uint64_t n64 = (serial - (serial & 1 ? 13 : 12)) / 2;
+      if( n64 > UINT16_MAX ) return FSS_TYPE_MISMATCH;
+      nData = (uint32_t)n64;
+      if( nData > nRecord - dataOff ) return FSS_CORRUPT;
+      v.type = serial & 1 ? FSS_TYPE_TEXT : FSS_TYPE_FIXED_BLOB;
+      v.u.p = pRecord + dataOff;
+      v.n_bytes = (uint16_t)nData;
+    }else{
+      return FSS_CORRUPT;
+    }
+    if( nData > nRecord - dataOff ) return FSS_CORRUPT;
+    dataOff += nData;
+    aValues[i] = v;
+  }
+  if( dataOff != nRecord ) return FSS_CORRUPT;
+  *pnValues = nValues;
+  return FSS_OK;
+}
+
 /*
 =========================================================================
 ** VALUE HELPERS
@@ -239,7 +336,9 @@ int fssCalculateRowSize(
   uint16_t nullBytes = 0;
   uint32_t dataBytes = 0;
 
-  if( pCols == NULL || nCols == 0 || nCols > FSS_MAX_COLUMNS ){
+  if( pCols == NULL || nCols == 0 || nCols > FSS_MAX_COLUMNS
+   || (flags & ~(FSS_FLAG_DENSE_ROWID|FSS_FLAG_NULLABLE))!=0
+  ){
     return FSS_ERROR;
   }
 
@@ -252,29 +351,31 @@ int fssCalculateRowSize(
     switch( pCols[i].type_id ){
       case FSS_TYPE_INT8:
         if( w == 0 ) w = 1;
+        else if( w != 1 ) return FSS_ERROR;
         break;
       case FSS_TYPE_INT16:
         if( w == 0 ) w = 2;
+        else if( w != 2 ) return FSS_ERROR;
         break;
       case FSS_TYPE_INT32:
       case FSS_TYPE_FLOAT32:
         if( w == 0 ) w = 4;
+        else if( w != 4 ) return FSS_ERROR;
         break;
       case FSS_TYPE_INT64:
       case FSS_TYPE_FLOAT64:
       case FSS_TYPE_TIMESTAMP_US:
         if( w == 0 ) w = 8;
-        break;
-      case FSS_TYPE_VAR_REF:
-        if( w == 0 ) w = 4;
+        else if( w != 8 ) return FSS_ERROR;
         break;
       case FSS_TYPE_FIXED_BLOB:
         if( w == 0 ) return FSS_ERROR;
         break;
       default:
-        break;
+        return FSS_ERROR;
     }
     dataBytes += w;
+    if( dataBytes + nullBytes > UINT16_MAX ) return FSS_ERROR;
   }
 
   if( pNullBytes ) *pNullBytes = nullBytes;
@@ -293,12 +394,16 @@ uint16_t fssCalculateCapacity(
   uint32_t fixedHeaderAndDesc;
   uint32_t avail;
 
-  if( rowPayloadSize == 0 ) return 0;
+  if( rowPayloadSize == 0 || nCols == 0 || nCols > FSS_MAX_COLUMNS
+   || pageSize > 65536
+   || hdrOffset > pageSize
+   || (flags & ~(FSS_FLAG_DENSE_ROWID|FSS_FLAG_NULLABLE))!=0
+  ) return 0;
 
   descSize = FSS_SCHEMA_HEADER_SIZE + (uint32_t)nCols * FSS_FIELD_DESC_SIZE;
   fixedHeaderAndDesc = FSS_HEADER_SIZE + descSize;
 
-  if( pageSize <= (uint32_t)hdrOffset + fixedHeaderAndDesc ){
+  if( pageSize < (uint32_t)hdrOffset + fixedHeaderAndDesc ){
     return 0;
   }
 
@@ -308,12 +413,13 @@ uint16_t fssCalculateCapacity(
     /* Dense sequential mode: index section is simply 8-byte min_rowid */
     if( avail <= 8 ) return 0;
     avail -= 8;
-    return (uint16_t)(avail / rowPayloadSize);
+    avail /= rowPayloadSize;
   }else{
     /* General / sparse mode: each slot requires 8 bytes rowid + rowPayloadSize */
     uint32_t slotTotal = 8 + (uint32_t)rowPayloadSize;
-    return (uint16_t)(avail / slotTotal);
+    avail /= slotTotal;
   }
+  return avail > UINT16_MAX ? UINT16_MAX : (uint16_t)avail;
 }
 
 int fssSchemaInit(
@@ -325,8 +431,21 @@ int fssSchemaInit(
   uint16_t offset;
   int rc;
 
-  if( pSchema == NULL || pCols == NULL || nCols == 0 || nCols > FSS_MAX_COLUMNS ){
+  if( pSchema == NULL || pCols == NULL || nCols == 0 || nCols > FSS_MAX_COLUMNS
+   || (flags & ~(FSS_FLAG_DENSE_ROWID|FSS_FLAG_NULLABLE))!=0
+  ){
     return FSS_ERROR;
+  }
+
+  for( uint16_t i = 0; i < nCols; i++ ){
+    if( pCols[i].col_flags & ~(FSS_COL_FLAG_NOT_NULL|FSS_COL_FLAG_PRIMARY_KEY) ){
+      return FSS_ERROR;
+    }
+    if( !(pCols[i].col_flags & FSS_COL_FLAG_NOT_NULL)
+     && !(flags & FSS_FLAG_NULLABLE)
+    ){
+      return FSS_ERROR;
+    }
   }
 
   memset(pSchema, 0, sizeof(*pSchema));
@@ -379,7 +498,7 @@ int fssIsFssPage(const uint8_t *aData, uint16_t hdrOffset) {
 =========================================================================
 */
 
-static void fssWriteSlot(
+void fssWriteSlot(
   uint8_t *pSlot,
   const FssSchema *pSchema,
   uint8_t pageFlags,
@@ -417,14 +536,16 @@ static void fssWriteSlot(
       case FSS_TYPE_FLOAT32:
         if( v->type == FSS_TYPE_FLOAT64 ){
           fssPutF32(pDest, (float)v->u.r);
-        }else if( v->type == FSS_TYPE_INT64 ){
+        }else if( v->type == FSS_TYPE_INT8 || v->type == FSS_TYPE_INT16 ||
+                  v->type == FSS_TYPE_INT32 || v->type == FSS_TYPE_INT64 ){
           fssPutF32(pDest, (float)v->u.i);
         }else{
           fssPutF32(pDest, v->u.f);
         }
         break;
       case FSS_TYPE_FLOAT64:
-        if( v->type == FSS_TYPE_INT64 ){
+        if( v->type == FSS_TYPE_INT8 || v->type == FSS_TYPE_INT16 ||
+            v->type == FSS_TYPE_INT32 || v->type == FSS_TYPE_INT64 ){
           fssPutF64(pDest, (double)v->u.i);
         }else{
           fssPutF64(pDest, v->u.r);
@@ -534,7 +655,10 @@ int fssPageInit(
   uint8_t *pData;
   int rc;
 
-  if( aData == NULL || pCols == NULL || pInitialValues == NULL || nCols == 0 ){
+  if( aData == NULL || pCols == NULL || pInitialValues == NULL || nCols == 0
+   || pageSize < 512 || pageSize > 65536 || hdrOffset > pageSize
+   || pageSize - hdrOffset < FSS_HEADER_SIZE
+  ){
     return FSS_ERROR;
   }
 
@@ -567,21 +691,21 @@ int fssPageInit(
   /*
   ** Section 1: Page Header (16 bytes)
   */
-  pHdr[0] = FSS_PAGE_TYPE;
-  pHdr[1] = flags;
-  fssPutU16(pHdr + 2, FSS_SCHEMA_VERSION);
-  fssPutU16(pHdr + 4, 1); /* Strict invariant: instantiated with exactly 1 row */
-  fssPutU16(pHdr + 6, capacity);
-  fssPutU16(pHdr + 8, schema.row_payload_size);
-  fssPutU16(pHdr + 10, FSS_HEADER_SIZE);
-  fssPutU16(pHdr + 12, dataAreaOffset);
-  fssPutU16(pHdr + 14, 0); /* Reserved */
+  pHdr[FSS_HDR_PAGE_TYPE] = FSS_PAGE_TYPE;
+  pHdr[FSS_HDR_FLAGS] = flags;
+  fssPutU16(pHdr + FSS_HDR_SCHEMA_VERSION, FSS_SCHEMA_VERSION);
+  fssPutU16(pHdr + FSS_HDR_CELL_COUNT, 1); /* Pages are created with one row. */
+  fssPutU16(pHdr + FSS_HDR_CAPACITY, capacity);
+  fssPutU16(pHdr + FSS_HDR_ROW_PAYLOAD_SIZE, schema.row_payload_size);
+  fssPutU16(pHdr + FSS_HDR_FIELD_DESC_OFFSET, FSS_HEADER_SIZE);
+  fssPutU16(pHdr + FSS_HDR_DATA_AREA_OFFSET, dataAreaOffset);
+  fssPutU16(pHdr + FSS_HDR_RESERVED, 0);
 
   /*
   ** Section 2: Field Type Descriptor
   */
   pDesc = pHdr + FSS_HEADER_SIZE;
-  fssPutU16(pDesc, nCols);
+  fssPutU16(pDesc + FSS_SCHEMA_NUM_COLUMNS, nCols);
   for( uint16_t i = 0; i < nCols; i++ ){
     pDesc[2 + i * 4] = schema.cols[i].type_id;
     pDesc[2 + i * 4 + 1] = schema.cols[i].col_flags;
@@ -609,17 +733,22 @@ int fssPageParse(
   uint16_t hdrOffset,
   FssPage *pPage
 ) {
-  const uint8_t *pHdr;
+  uint8_t *pHdr;
   const uint8_t *pDesc;
   uint16_t nCols;
   uint16_t descSize;
+  uint16_t rowPayloadSize;
+  uint32_t expectedCapacity;
+  uint32_t expectedDataOffset;
 
-  if( aData == NULL || pPage == NULL || pageSize < 512 ){
+  if( aData == NULL || pPage == NULL || pageSize < 512 || pageSize > 65536
+   || hdrOffset > pageSize || pageSize - hdrOffset < FSS_HEADER_SIZE
+  ){
     return FSS_ERROR;
   }
 
   pHdr = aData + hdrOffset;
-  if( pHdr[0] != FSS_PAGE_TYPE ){
+  if( pHdr[FSS_HDR_PAGE_TYPE] != FSS_PAGE_TYPE ){
     return FSS_CORRUPT;
   }
 
@@ -629,44 +758,98 @@ int fssPageParse(
   pPage->hdrOffset = hdrOffset;
 
   /* Read Header */
-  pPage->hdr.page_type = pHdr[0];
-  pPage->hdr.flags = pHdr[1];
-  pPage->hdr.schema_version = fssGetU16(pHdr + 2);
-  pPage->hdr.cell_count = fssGetU16(pHdr + 4);
-  pPage->hdr.capacity = fssGetU16(pHdr + 6);
-  pPage->hdr.row_payload_size = fssGetU16(pHdr + 8);
-  pPage->hdr.field_desc_offset = fssGetU16(pHdr + 10);
-  pPage->hdr.data_area_offset = fssGetU16(pHdr + 12);
-  pPage->hdr.reserved = fssGetU16(pHdr + 14);
+  pPage->hdr.page_type = pHdr[FSS_HDR_PAGE_TYPE];
+  pPage->hdr.flags = pHdr[FSS_HDR_FLAGS];
+  pPage->hdr.schema_version = fssGetU16(pHdr + FSS_HDR_SCHEMA_VERSION);
+  pPage->hdr.cell_count = fssGetU16(pHdr + FSS_HDR_CELL_COUNT);
+  pPage->hdr.capacity = fssGetU16(pHdr + FSS_HDR_CAPACITY);
+  pPage->hdr.row_payload_size = fssGetU16(pHdr + FSS_HDR_ROW_PAYLOAD_SIZE);
+  pPage->hdr.field_desc_offset = fssGetU16(pHdr + FSS_HDR_FIELD_DESC_OFFSET);
+  pPage->hdr.data_area_offset = fssGetU16(pHdr + FSS_HDR_DATA_AREA_OFFSET);
+  pPage->hdr.reserved = fssGetU16(pHdr + FSS_HDR_RESERVED);
 
-  if( pPage->hdr.cell_count > pPage->hdr.capacity || pPage->hdr.capacity == 0 ){
+  if( pPage->hdr.schema_version != FSS_SCHEMA_VERSION
+   || pPage->hdr.cell_count == 0
+   || pPage->hdr.cell_count > pPage->hdr.capacity
+   || pPage->hdr.capacity == 0
+   || (pPage->hdr.flags & ~(FSS_FLAG_DENSE_ROWID|FSS_FLAG_NULLABLE))!=0
+   || pPage->hdr.reserved != 0
+   || pPage->hdr.field_desc_offset != FSS_HEADER_SIZE
+  ){
     return FSS_CORRUPT;
   }
 
   /* Read Schema */
+  if( pPage->hdr.field_desc_offset > pageSize - hdrOffset
+   || pageSize - hdrOffset - pPage->hdr.field_desc_offset < FSS_SCHEMA_HEADER_SIZE
+  ){
+    return FSS_CORRUPT;
+  }
   pDesc = pHdr + pPage->hdr.field_desc_offset;
-  nCols = fssGetU16(pDesc);
+  nCols = fssGetU16(pDesc + FSS_SCHEMA_NUM_COLUMNS);
   if( nCols == 0 || nCols > FSS_MAX_COLUMNS ){
+    return FSS_CORRUPT;
+  }
+  descSize = FSS_SCHEMA_HEADER_SIZE + nCols * FSS_FIELD_DESC_SIZE;
+  if( descSize > pageSize - hdrOffset - pPage->hdr.field_desc_offset ){
     return FSS_CORRUPT;
   }
 
   FssFieldDesc cols[FSS_MAX_COLUMNS];
   for( uint16_t i = 0; i < nCols; i++ ){
-    cols[i].type_id = pDesc[2 + i * 4];
-    cols[i].col_flags = pDesc[2 + i * 4 + 1];
-    cols[i].byte_width = fssGetU16(pDesc + 2 + i * 4 + 2);
+    cols[i].type_id = pDesc[FSS_SCHEMA_COLUMNS + i * FSS_FIELD_DESC_SIZE];
+    cols[i].col_flags = pDesc[FSS_SCHEMA_COLUMNS + i * FSS_FIELD_DESC_SIZE + 1];
+    cols[i].byte_width = fssGetU16(pDesc + FSS_SCHEMA_COLUMNS + i * FSS_FIELD_DESC_SIZE + 2);
   }
 
   if( fssSchemaInit(&pPage->schema, cols, nCols, pPage->hdr.flags) != FSS_OK ){
     return FSS_CORRUPT;
   }
 
-  descSize = FSS_SCHEMA_HEADER_SIZE + nCols * FSS_FIELD_DESC_SIZE;
-  pPage->aRowIndex = aData + hdrOffset + FSS_HEADER_SIZE + descSize;
-  pPage->aDataArea = aData + hdrOffset + pPage->hdr.data_area_offset;
+  if( pPage->schema.row_payload_size != pPage->hdr.row_payload_size ){
+    return FSS_CORRUPT;
+  }
+  rowPayloadSize = pPage->schema.row_payload_size;
+  expectedCapacity = fssCalculateCapacity(pageSize, hdrOffset, nCols,
+                                           rowPayloadSize, pPage->hdr.flags);
+  if( expectedCapacity == 0
+   || expectedCapacity != pPage->hdr.capacity
+  ){
+    return FSS_CORRUPT;
+  }
+  expectedDataOffset = FSS_HEADER_SIZE + descSize;
+  if( pPage->hdr.flags & FSS_FLAG_DENSE_ROWID ){
+    expectedDataOffset += 8;
+  }else{
+    expectedDataOffset += 8 * expectedCapacity;
+  }
+  if( expectedDataOffset > UINT16_MAX
+   || pPage->hdr.data_area_offset != expectedDataOffset
+   || (uint32_t)hdrOffset + expectedDataOffset > pageSize
+   || (uint32_t)pPage->hdr.cell_count * rowPayloadSize >
+      pageSize - hdrOffset - expectedDataOffset
+  ){
+    return FSS_CORRUPT;
+  }
+
+  pPage->aRowIndex = pHdr + FSS_HEADER_SIZE + descSize;
+  pPage->aDataArea = pHdr + pPage->hdr.data_area_offset;
 
   if( pPage->hdr.flags & FSS_FLAG_DENSE_ROWID ){
     pPage->min_rowid = fssGetI64(pPage->aRowIndex);
+    if( pPage->min_rowid > INT64_MAX - (int64_t)(pPage->hdr.cell_count - 1) ){
+      return FSS_CORRUPT;
+    }
+  }else{
+    for( uint16_t i = 1; i < pPage->hdr.cell_count; i++ ){
+      if( fssGetI64(pPage->aRowIndex + (i - 1) * 8) >=
+          fssGetI64(pPage->aRowIndex + i * 8) ){
+        return FSS_CORRUPT;
+      }
+    }
+    for( uint32_t i = pPage->hdr.cell_count; i < pPage->hdr.capacity; i++ ){
+      if( fssGetI64(pPage->aRowIndex + i * 8) != 0 ) return FSS_CORRUPT;
+    }
   }
 
   return FSS_OK;
@@ -781,6 +964,69 @@ int fssCheckRowMatchesSchema(
 =========================================================================
 */
 
+/* Repack a dense page as sparse. Optionally omit one row while converting. */
+static int fssPageDenseToSparse(FssPage *pPage, int iSkip){
+  uint16_t oldCount = pPage->hdr.cell_count;
+  uint16_t newCount = oldCount - (iSkip >= 0 ? 1 : 0);
+  uint16_t nCols = pPage->schema.num_columns;
+  uint16_t rowSize = pPage->hdr.row_payload_size;
+  uint32_t descEnd = FSS_HEADER_SIZE + FSS_SCHEMA_HEADER_SIZE
+                   + (uint32_t)nCols * FSS_FIELD_DESC_SIZE;
+  uint16_t newCapacity;
+  uint32_t newDataOffset;
+  uint8_t *savedRows;
+  uint8_t *pHdr;
+  uint8_t *pNewIndex;
+  uint8_t *pNewData;
+  uint16_t dst = 0;
+
+  if( !(pPage->hdr.flags & FSS_FLAG_DENSE_ROWID)
+   || (iSkip >= 0 && iSkip >= oldCount)
+  ) return FSS_ERROR;
+
+  newCapacity = fssCalculateCapacity(pPage->pageSize, pPage->hdrOffset,
+                                     nCols, rowSize,
+                                     pPage->hdr.flags & ~FSS_FLAG_DENSE_ROWID);
+  if( newCapacity == 0 || newCount > newCapacity ) return FSS_FULL;
+  savedRows = (uint8_t*)malloc((size_t)oldCount * rowSize);
+  if( savedRows == NULL ) return FSS_ERROR;
+  memcpy(savedRows, pPage->aDataArea, (size_t)oldCount * rowSize);
+
+  newDataOffset = descEnd + (uint32_t)newCapacity * 8;
+  if( newDataOffset > UINT16_MAX
+   || (uint32_t)pPage->hdrOffset + newDataOffset +
+      (uint32_t)newCount * rowSize > pPage->pageSize
+  ){
+    free(savedRows);
+    return FSS_FULL;
+  }
+
+  pHdr = pPage->aData + pPage->hdrOffset;
+  memset(pHdr + descEnd, 0, pPage->pageSize - pPage->hdrOffset - descEnd);
+  pPage->hdr.flags &= (uint8_t)~FSS_FLAG_DENSE_ROWID;
+  pPage->hdr.capacity = newCapacity;
+  pPage->hdr.cell_count = newCount;
+  pPage->hdr.data_area_offset = (uint16_t)newDataOffset;
+  pHdr[FSS_HDR_FLAGS] = pPage->hdr.flags;
+  fssPutU16(pHdr + FSS_HDR_CAPACITY, newCapacity);
+  fssPutU16(pHdr + FSS_HDR_CELL_COUNT, newCount);
+  fssPutU16(pHdr + FSS_HDR_DATA_AREA_OFFSET, (uint16_t)newDataOffset);
+
+  pNewIndex = pHdr + descEnd;
+  pNewData = pHdr + newDataOffset;
+  for( uint16_t src = 0; src < oldCount; src++ ){
+    if( src == iSkip ) continue;
+    fssPutI64(pNewIndex + dst * 8, pPage->min_rowid + src);
+    memcpy(pNewData + (size_t)dst * rowSize,
+           savedRows + (size_t)src * rowSize, rowSize);
+    dst++;
+  }
+  pPage->aRowIndex = pNewIndex;
+  pPage->aDataArea = pNewData;
+  free(savedRows);
+  return FSS_OK;
+}
+
 int fssPageFindRow(
   const FssPage *pPage,
   int64_t rowid,
@@ -794,12 +1040,16 @@ int fssPageFindRow(
   }
 
   if( pPage->hdr.flags & FSS_FLAG_DENSE_ROWID ){
-    int64_t slot = rowid - pPage->min_rowid;
-    if( slot >= 0 && slot < (int64_t)pPage->hdr.cell_count ){
+    if( rowid < pPage->min_rowid ){
+      *pSlotIndex = 0;
+      return FSS_NOTFOUND;
+    }
+    uint64_t slot = (uint64_t)rowid - (uint64_t)pPage->min_rowid;
+    if( slot < pPage->hdr.cell_count ){
       *pSlotIndex = (uint16_t)slot;
       return FSS_OK;
     }
-    *pSlotIndex = (slot < 0) ? 0 : pPage->hdr.cell_count;
+    *pSlotIndex = pPage->hdr.cell_count;
     return FSS_NOTFOUND;
   }else{
     /* Binary search in sorted rowid array */
@@ -837,43 +1087,42 @@ int fssPageInsert(
 
   if( pPage == NULL || pValues == NULL ) return FSS_ERROR;
 
+  rc = fssPageFindRow(pPage, rowid, &targetSlot);
+  if( rc == FSS_OK ) return FSS_DUPLICATE;
+
+  rc = fssCheckRowMatchesSchema(&pPage->schema, pPage->hdr.flags, pValues, nValues);
+  if( rc != FSS_OK ) return FSS_TYPE_MISMATCH;
+
   /* Check capacity */
   if( pPage->hdr.cell_count >= pPage->hdr.capacity ){
     return FSS_FULL;
-  }
-
-  /* Check schema match */
-  rc = fssCheckRowMatchesSchema(&pPage->schema, pPage->hdr.flags, pValues, nValues);
-  if( rc != FSS_OK ){
-    return FSS_TYPE_MISMATCH;
-  }
-
-  rc = fssPageFindRow(pPage, rowid, &targetSlot);
-  if( rc == FSS_OK ){
-    return FSS_DUPLICATE;
   }
 
   uint16_t count = pPage->hdr.cell_count;
   uint16_t rsz = pPage->hdr.row_payload_size;
 
   if( pPage->hdr.flags & FSS_FLAG_DENSE_ROWID ){
-    if( count == 0 ){
-      pPage->min_rowid = rowid;
-      fssPutI64(pPage->aRowIndex, rowid);
-      targetSlot = 0;
-    }else if( rowid == pPage->min_rowid + count ){
+    if( pPage->min_rowid <= INT64_MAX - (int64_t)count
+     && rowid == pPage->min_rowid + (int64_t)count
+    ){
       targetSlot = count;
-    }else if( rowid == pPage->min_rowid - 1 ){
+    }else if( pPage->min_rowid > INT64_MIN
+           && rowid == pPage->min_rowid - 1
+    ){
       /* Prepend row */
       memmove(pPage->aDataArea + rsz, pPage->aDataArea, (size_t)count * rsz);
       pPage->min_rowid = rowid;
       fssPutI64(pPage->aRowIndex, rowid);
       targetSlot = 0;
     }else{
-      /* Dense mode gap encountered: cannot store non-contiguous rowid in dense mode */
-      return FSS_FULL;
+      rc = fssPageDenseToSparse(pPage, -1);
+      if( rc != FSS_OK ) return rc;
+      rc = fssPageFindRow(pPage, rowid, &targetSlot);
+      if( rc == FSS_OK ) return FSS_DUPLICATE;
     }
-  }else{
+  }
+
+  if( !(pPage->hdr.flags & FSS_FLAG_DENSE_ROWID) ){
     /* Sparse mode: shift existing rows right to make room */
     if( targetSlot < count ){
       memmove(pPage->aRowIndex + (targetSlot + 1) * 8,
@@ -891,7 +1140,8 @@ int fssPageInsert(
 
   /* Increment cell count and update disk header */
   pPage->hdr.cell_count++;
-  fssPutU16(pPage->aData + pPage->hdrOffset + 4, pPage->hdr.cell_count);
+  fssPutU16(pPage->aData + pPage->hdrOffset + FSS_HDR_CELL_COUNT,
+            pPage->hdr.cell_count);
 
   return FSS_OK;
 }
@@ -932,8 +1182,8 @@ int fssPageDelete(
       /* Simply truncate trailing slot */
       memset(pPage->aDataArea + (count - 1) * rsz, 0, rsz);
     }else{
-      /* Middle deletion in dense mode creates a hole: cannot remain dense */
-      return FSS_ERROR;
+      /* A middle delete breaks contiguity; convert while omitting this row. */
+      return fssPageDenseToSparse(pPage, targetSlot);
     }
   }else{
     /* Sparse mode: shift subsequent elements left */
@@ -950,7 +1200,8 @@ int fssPageDelete(
   }
 
   pPage->hdr.cell_count--;
-  fssPutU16(pPage->aData + pPage->hdrOffset + 4, pPage->hdr.cell_count);
+  fssPutU16(pPage->aData + pPage->hdrOffset + FSS_HDR_CELL_COUNT,
+            pPage->hdr.cell_count);
 
   return FSS_OK;
 }
@@ -1004,63 +1255,20 @@ int fssPageUpdateColumn(
   uint16_t colIndex,
   const FssValue *pVal
 ) {
+  FssValue row[FSS_MAX_COLUMNS];
   if( pPage == NULL || pVal == NULL ) return FSS_ERROR;
   if( slotIndex >= pPage->hdr.cell_count ) return FSS_NOTFOUND;
   if( colIndex >= pPage->schema.num_columns ) return FSS_ERROR;
-
-  /* Check column constraints */
-  if( pVal->is_null ){
-    if( pPage->schema.cols[colIndex].col_flags & FSS_COL_FLAG_NOT_NULL ){
-      return FSS_TYPE_MISMATCH;
-    }
-    if( !(pPage->hdr.flags & FSS_FLAG_NULLABLE) ){
-      return FSS_TYPE_MISMATCH;
-    }
+  if( fssPageGetRow(pPage, slotIndex, NULL, row, FSS_MAX_COLUMNS) != FSS_OK ){
+    return FSS_ERROR;
   }
-
-  uint8_t *pSlot = pPage->aDataArea + slotIndex * pPage->hdr.row_payload_size;
-
-  if( pPage->hdr.flags & FSS_FLAG_NULLABLE ){
-    if( pVal->is_null ){
-      pSlot[colIndex / 8] |= (uint8_t)(1 << (colIndex % 8));
-      return FSS_OK;
-    }else{
-      pSlot[colIndex / 8] &= (uint8_t)~(1 << (colIndex % 8));
-    }
+  row[colIndex] = *pVal;
+  if( fssCheckRowMatchesSchema(&pPage->schema, pPage->hdr.flags, row,
+                               pPage->schema.num_columns) != FSS_OK ){
+    return FSS_TYPE_MISMATCH;
   }
-
-  uint8_t *pDest = pSlot + pPage->schema.col_offsets[colIndex];
-  switch( pPage->schema.cols[colIndex].type_id ){
-    case FSS_TYPE_INT8:
-      *pDest = (uint8_t)(pVal->u.i & 0xff);
-      break;
-    case FSS_TYPE_INT16:
-      fssPutU16(pDest, (uint16_t)pVal->u.i);
-      break;
-    case FSS_TYPE_INT32:
-      fssPutU32(pDest, (uint32_t)pVal->u.i);
-      break;
-    case FSS_TYPE_INT64:
-    case FSS_TYPE_TIMESTAMP_US:
-      fssPutI64(pDest, pVal->u.i);
-      break;
-    case FSS_TYPE_FLOAT32:
-      fssPutF32(pDest, (float)(pVal->type == FSS_TYPE_FLOAT64 ? pVal->u.r : pVal->u.f));
-      break;
-    case FSS_TYPE_FLOAT64:
-      fssPutF64(pDest, pVal->u.r);
-      break;
-    case FSS_TYPE_FIXED_BLOB:
-      if( pVal->u.p != NULL ){
-        uint16_t w = pPage->schema.cols[colIndex].byte_width;
-        uint16_t copyLen = pVal->n_bytes < w ? pVal->n_bytes : w;
-        memcpy(pDest, pVal->u.p, copyLen);
-      }
-      break;
-    default:
-      return FSS_ERROR;
-  }
-
+  fssWriteSlot(pPage->aDataArea + (size_t)slotIndex * pPage->hdr.row_payload_size,
+               &pPage->schema, pPage->hdr.flags, row);
   return FSS_OK;
 }
 
@@ -1209,8 +1417,8 @@ int fssPageScanFilter(
 */
 typedef struct FssDynCell {
   int64_t rowid;
-  uint16_t cellSize;
-  uint8_t aData[1024]; /* Sufficient for non-overflow leaf row payloads */
+  uint32_t cellSize;
+  uint8_t *aData;
 } FssDynCell;
 
 /*
@@ -1223,93 +1431,141 @@ static int fssEncodeSqliteCell(
   uint16_t nValues,
   FssDynCell *pCell
 ) {
-  uint8_t payloadBuf[1024];
-  uint8_t hdrVarints[256];
-  uint16_t hdrBytes = 0;
-  uint16_t dataBytes = 0;
-  uint8_t dataBuf[1024];
+  uint64_t aSerial[FSS_MAX_COLUMNS];
+  uint32_t serialBytes = 0;
+  uint32_t dataBytes = 0;
+  uint32_t recordHeaderSize;
+  uint32_t payloadSize;
+  uint32_t rowidBytes;
+  uint32_t payloadLenBytes;
+  uint32_t cellSize;
+  uint8_t *p;
 
+  if( pValues == NULL || pCell == NULL || nValues > FSS_MAX_COLUMNS ) return FSS_ERROR;
+  pCell->aData = NULL;
+  pCell->cellSize = 0;
   pCell->rowid = rowid;
 
   for( uint16_t i = 0; i < nValues; i++ ){
     const FssValue *v = &pValues[i];
-    uint64_t serialType = 0;
-
+    uint32_t nData = 0;
     if( v->is_null ){
-      serialType = 0;
+      aSerial[i] = 0;
     }else if( v->type == FSS_TYPE_INT8 || v->type == FSS_TYPE_INT16 ||
               v->type == FSS_TYPE_INT32 || v->type == FSS_TYPE_INT64 ||
               v->type == FSS_TYPE_TIMESTAMP_US ){
       int64_t val = v->u.i;
-      if( val == 0 ){
-        serialType = 8;
-      }else if( val == 1 ){
-        serialType = 9;
-      }else if( val >= -128 && val <= 127 ){
-        serialType = 1;
-        dataBuf[dataBytes++] = (uint8_t)(val & 0xff);
-      }else if( val >= -32768 && val <= 32767 ){
-        serialType = 2;
-        fssPutU16(dataBuf + dataBytes, (uint16_t)val);
-        dataBytes += 2;
-      }else if( val >= -8388608 && val <= 8388607 ){
-        serialType = 3;
-        dataBuf[dataBytes++] = (uint8_t)((val >> 16) & 0xff);
-        dataBuf[dataBytes++] = (uint8_t)((val >> 8) & 0xff);
-        dataBuf[dataBytes++] = (uint8_t)(val & 0xff);
-      }else if( val >= (int64_t)INT32_MIN && val <= (int64_t)INT32_MAX ){
-        serialType = 4;
-        fssPutU32(dataBuf + dataBytes, (uint32_t)val);
-        dataBytes += 4;
-      }else{
-        serialType = 6;
-        fssPutI64(dataBuf + dataBytes, val);
-        dataBytes += 8;
-      }
+      if( val == 0 ) aSerial[i] = 8;
+      else if( val == 1 ) aSerial[i] = 9;
+      else if( val >= -128 && val <= 127 ){ aSerial[i] = 1; nData=1; }
+      else if( val >= -32768 && val <= 32767 ){ aSerial[i] = 2; nData=2; }
+      else if( val >= -8388608 && val <= 8388607 ){ aSerial[i] = 3; nData=3; }
+      else if( val >= INT32_MIN && val <= INT32_MAX ){ aSerial[i] = 4; nData=4; }
+      else if( val >= -140737488355328LL && val <= 140737488355327LL ){
+        aSerial[i] = 5; nData=6;
+      }else{ aSerial[i] = 6; nData=8; }
     }else if( v->type == FSS_TYPE_FLOAT64 || v->type == FSS_TYPE_FLOAT32 ){
-      serialType = 7;
-      fssPutF64(dataBuf + dataBytes, v->type == FSS_TYPE_FLOAT64 ? v->u.r : (double)v->u.f);
-      dataBytes += 8;
-    }else if( v->type == FSS_TYPE_TEXT ){
-      serialType = 2 * (uint64_t)v->n_bytes + 13;
-      if( v->u.p && v->n_bytes > 0 ){
-        memcpy(dataBuf + dataBytes, v->u.p, v->n_bytes);
-        dataBytes += v->n_bytes;
-      }
-    }else if( v->type == FSS_TYPE_FIXED_BLOB ){
-      serialType = 2 * (uint64_t)v->n_bytes + 12;
-      if( v->u.p && v->n_bytes > 0 ){
-        memcpy(dataBuf + dataBytes, v->u.p, v->n_bytes);
-        dataBytes += v->n_bytes;
-      }
+      aSerial[i] = 7; nData = 8;
+    }else if( v->type == FSS_TYPE_TEXT || v->type == FSS_TYPE_FIXED_BLOB ){
+      if( v->n_bytes > 0 && v->u.p == NULL ) return FSS_ERROR;
+      aSerial[i] = 2 * (uint64_t)v->n_bytes +
+                   (v->type == FSS_TYPE_TEXT ? 13 : 12);
+      nData = v->n_bytes;
+    }else{
+      return FSS_TYPE_MISMATCH;
     }
-
-    hdrBytes += (uint16_t)fssPutVarint(hdrVarints + hdrBytes, serialType);
+    if( UINT32_MAX - dataBytes < nData ) return FSS_FULL;
+    dataBytes += nData;
+    serialBytes += (uint32_t)fssVarintLen(aSerial[i]);
   }
 
-  /* Compute record header size including header size varint */
-  uint16_t totalHdrSize = hdrBytes + 1;
-  if( totalHdrSize > 127 ){
-    totalHdrSize = hdrBytes + 2;
+  recordHeaderSize = serialBytes + 1;
+  while( recordHeaderSize != serialBytes + (uint32_t)fssVarintLen(recordHeaderSize) ){
+    recordHeaderSize = serialBytes + (uint32_t)fssVarintLen(recordHeaderSize);
+  }
+  if( UINT32_MAX - recordHeaderSize < dataBytes ) return FSS_FULL;
+  payloadSize = recordHeaderSize + dataBytes;
+  rowidBytes = (uint32_t)fssVarintLen((uint64_t)rowid);
+  payloadLenBytes = (uint32_t)fssVarintLen(payloadSize);
+  if( UINT32_MAX - payloadLenBytes < rowidBytes + payloadSize ) return FSS_FULL;
+  cellSize = payloadLenBytes + rowidBytes + payloadSize;
+  p = (uint8_t*)malloc(cellSize);
+  if( p == NULL ) return FSS_ERROR;
+
+  uint32_t off = 0;
+  off += (uint32_t)fssPutVarint(p + off, payloadSize);
+  off += (uint32_t)fssPutVarint(p + off, (uint64_t)rowid);
+  off += (uint32_t)fssPutVarint(p + off, recordHeaderSize);
+  for( uint16_t i = 0; i < nValues; i++ ){
+    off += (uint32_t)fssPutVarint(p + off, aSerial[i]);
+  }
+  for( uint16_t i = 0; i < nValues; i++ ){
+    const FssValue *v = &pValues[i];
+    int64_t val;
+    uint32_t nData = 0;
+    if( v->is_null ) continue;
+    if( v->type == FSS_TYPE_INT8 || v->type == FSS_TYPE_INT16 ||
+        v->type == FSS_TYPE_INT32 || v->type == FSS_TYPE_INT64 ||
+        v->type == FSS_TYPE_TIMESTAMP_US ){
+      val = v->u.i;
+      if( aSerial[i] == 1 ) p[off++] = (uint8_t)val;
+      else if( aSerial[i] == 2 ){ fssPutU16(p + off, (uint16_t)val); off += 2; }
+      else if( aSerial[i] == 3 ){
+        uint64_t u = (uint64_t)val; p[off++] = (uint8_t)(u >> 16);
+        p[off++] = (uint8_t)(u >> 8); p[off++] = (uint8_t)u;
+      }else if( aSerial[i] == 4 ){ fssPutU32(p + off, (uint32_t)val); off += 4; }
+      else if( aSerial[i] == 5 ){
+        uint64_t u = (uint64_t)val;
+        for( int b = 5; b >= 0; b-- ) p[off++] = (uint8_t)(u >> (8*b));
+      }else if( aSerial[i] == 6 ){ fssPutI64(p + off, val); off += 8; }
+    }else if( v->type == FSS_TYPE_FLOAT64 || v->type == FSS_TYPE_FLOAT32 ){
+      fssPutF64(p + off, v->type == FSS_TYPE_FLOAT64 ? v->u.r : (double)v->u.f);
+      off += 8;
+    }else{
+      nData = v->n_bytes;
+      if( nData ) memcpy(p + off, v->u.p, nData);
+      off += nData;
+    }
   }
 
-  uint16_t pOff = 0;
-  pOff += (uint16_t)fssPutVarint(payloadBuf + pOff, totalHdrSize);
-  memcpy(payloadBuf + pOff, hdrVarints, hdrBytes);
-  pOff += hdrBytes;
-  memcpy(payloadBuf + pOff, dataBuf, dataBytes);
-  pOff += dataBytes;
+  if( off != cellSize ){
+    free(p);
+    return FSS_ERROR;
+  }
+  pCell->aData = p;
+  pCell->cellSize = cellSize;
+  return FSS_OK;
+}
 
-  uint16_t payloadLen = pOff;
+static void fssFreeDynCell(FssDynCell *pCell){
+  free(pCell->aData);
+  pCell->aData = NULL;
+  pCell->cellSize = 0;
+}
 
-  /* Form outer SQLite cell */
-  uint16_t cellLen = 0;
-  cellLen += (uint16_t)fssPutVarint(pCell->aData + cellLen, payloadLen);
-  cellLen += (uint16_t)fssPutVarint(pCell->aData + cellLen, (uint64_t)rowid);
-  memcpy(pCell->aData + cellLen, payloadBuf, payloadLen);
-  cellLen += payloadLen;
-
-  pCell->cellSize = cellLen;
+int fssValuesToSqliteCell(
+  int64_t rowid,
+  const FssValue *aValues,
+  uint16_t nValues,
+  uint8_t *pCell,
+  uint32_t cellCapacity,
+  uint32_t *pnCell
+){
+  FssDynCell cell;
+  int rc;
+  if( pnCell == NULL ) return FSS_ERROR;
+  *pnCell = 0;
+  rc = fssEncodeSqliteCell(rowid, aValues, nValues, &cell);
+  if( rc != FSS_OK ) return rc;
+  *pnCell = cell.cellSize;
+  if( pCell != NULL ){
+    if( cellCapacity < cell.cellSize ){
+      fssFreeDynCell(&cell);
+      return FSS_FULL;
+    }
+    memcpy(pCell, cell.aData, cell.cellSize);
+  }
+  fssFreeDynCell(&cell);
   return FSS_OK;
 }
 
@@ -1321,6 +1577,79 @@ static int compareCells(const void *a, const void *b) {
   return 0;
 }
 
+static void fssFreeDynCells(FssDynCell *aCells, uint16_t nCells){
+  if( aCells == NULL ) return;
+  for( uint16_t i = 0; i < nCells; i++ ) fssFreeDynCell(&aCells[i]);
+  free(aCells);
+}
+
+static int fssBuildDemotionCells(
+  const FssPage *pPage,
+  int64_t mismatched_rowid,
+  const FssValue *pMismatchedValues,
+  uint16_t nMismatchValues,
+  FssDynCell **paCells,
+  uint16_t *pnCells
+){
+  uint16_t count;
+  uint32_t allocCount;
+  uint16_t nOut = 0;
+  int found = 0;
+  FssDynCell *aCells;
+  FssValue vals[FSS_MAX_COLUMNS];
+  int rc = FSS_OK;
+
+  if( pPage == NULL || paCells == NULL || pnCells == NULL ) return FSS_ERROR;
+  if( pMismatchedValues != NULL &&
+      (nMismatchValues != pPage->schema.num_columns ||
+       nMismatchValues > FSS_MAX_COLUMNS) ){
+    return FSS_ERROR;
+  }
+  count = pPage->hdr.cell_count;
+  allocCount = (uint32_t)count + (pMismatchedValues != NULL ? 1 : 0);
+  if( allocCount == 0 || allocCount > UINT16_MAX ) return FSS_FULL;
+  aCells = (FssDynCell*)calloc(allocCount, sizeof(FssDynCell));
+  if( aCells == NULL ) return FSS_ERROR;
+
+  for( uint16_t i = 0; i < count; i++ ){
+    int64_t rid;
+    if( fssPageGetRow(pPage, i, &rid, vals, FSS_MAX_COLUMNS) != FSS_OK ){
+      rc = FSS_CORRUPT;
+      break;
+    }
+    if( pMismatchedValues != NULL && rid == mismatched_rowid ){
+      rc = fssEncodeSqliteCell(rid, pMismatchedValues, nMismatchValues,
+                               &aCells[nOut]);
+      found = 1;
+    }else{
+      rc = fssEncodeSqliteCell(rid, vals, pPage->schema.num_columns,
+                               &aCells[nOut]);
+    }
+    if( rc != FSS_OK ) break;
+    nOut++;
+  }
+  if( rc == FSS_OK && pMismatchedValues != NULL && !found ){
+    rc = fssEncodeSqliteCell(mismatched_rowid, pMismatchedValues,
+                             nMismatchValues, &aCells[nOut]);
+    if( rc == FSS_OK ) nOut++;
+  }
+  if( rc != FSS_OK ){
+    fssFreeDynCells(aCells, (uint16_t)allocCount);
+    return rc;
+  }
+
+  qsort(aCells, nOut, sizeof(FssDynCell), compareCells);
+  for( uint16_t i = 1; i < nOut; i++ ){
+    if( aCells[i - 1].rowid >= aCells[i].rowid ){
+      fssFreeDynCells(aCells, (uint16_t)allocCount);
+      return FSS_DUPLICATE;
+    }
+  }
+  *paCells = aCells;
+  *pnCells = nOut;
+  return FSS_OK;
+}
+
 int fssCalculateDemotedSize(
   const FssPage *pPage,
   int64_t mismatched_rowid,
@@ -1330,27 +1659,20 @@ int fssCalculateDemotedSize(
 ) {
   if( pPage == NULL || pnBytesNeeded == NULL ) return FSS_ERROR;
 
-  uint16_t count = pPage->hdr.cell_count;
-  uint16_t totalCells = count + (pMismatchedValues != NULL ? 1 : 0);
-  uint32_t totalCellBytes = 0;
-
-  FssValue vals[FSS_MAX_COLUMNS];
-  FssDynCell cell;
-
-  for( uint16_t i = 0; i < count; i++ ){
-    int64_t rid;
-    fssPageGetRow(pPage, i, &rid, vals, FSS_MAX_COLUMNS);
-    fssEncodeSqliteCell(rid, vals, pPage->schema.num_columns, &cell);
-    totalCellBytes += cell.cellSize;
-  }
-
-  if( pMismatchedValues != NULL ){
-    fssEncodeSqliteCell(mismatched_rowid, pMismatchedValues, nMismatchValues, &cell);
-    totalCellBytes += cell.cellSize;
-  }
-
-  /* 0x0D header: 8 bytes + 2 bytes per cell pointer */
-  *pnBytesNeeded = pPage->hdrOffset + 8 + 2 * (uint32_t)totalCells + totalCellBytes;
+  FssDynCell *aCells = NULL;
+  uint16_t nCells = 0;
+  uint64_t totalCellBytes = 0;
+  uint64_t needed;
+  int rc = fssBuildDemotionCells(pPage, mismatched_rowid,
+                                  pMismatchedValues, nMismatchValues,
+                                  &aCells, &nCells);
+  if( rc != FSS_OK ) return rc;
+  for( uint16_t i = 0; i < nCells; i++ ) totalCellBytes += aCells[i].cellSize;
+  /* Standard 0x0D header, pointer array, and encoded cells. */
+  needed = (uint64_t)pPage->hdrOffset + 8 + 2 * (uint64_t)nCells + totalCellBytes;
+  fssFreeDynCells(aCells, nCells);
+  if( needed > UINT32_MAX ) return FSS_FULL;
+  *pnBytesNeeded = (uint32_t)needed;
   return FSS_OK;
 }
 
@@ -1362,35 +1684,21 @@ int fssPageDemoteToDynamic(
 ) {
   if( pPage == NULL ) return FSS_ERROR;
 
-  uint16_t count = pPage->hdr.cell_count;
-  uint16_t totalCells = count + (pMismatchedValues != NULL ? 1 : 0);
-  uint32_t bytesNeeded = 0;
-
-  int rc = fssCalculateDemotedSize(pPage, mismatched_rowid, pMismatchedValues, nMismatchValues, &bytesNeeded);
+  FssDynCell *aCells = NULL;
+  uint16_t totalCells = 0;
+  uint64_t totalCellBytes = 0;
+  uint64_t bytesNeeded;
+  int rc = fssBuildDemotionCells(pPage, mismatched_rowid,
+                                  pMismatchedValues, nMismatchValues,
+                                  &aCells, &totalCells);
   if( rc != FSS_OK ) return rc;
-
-  /* If space needed exceeds page size, B-tree balancing / split is required */
+  for( uint16_t i = 0; i < totalCells; i++ ) totalCellBytes += aCells[i].cellSize;
+  bytesNeeded = (uint64_t)pPage->hdrOffset + 8 +
+                2 * (uint64_t)totalCells + totalCellBytes;
   if( bytesNeeded > pPage->pageSize ){
+    fssFreeDynCells(aCells, totalCells);
     return FSS_SPLIT_REQUIRED;
   }
-
-  /* Allocate snapshot buffer for decoded cells */
-  FssDynCell *aCells = (FssDynCell*)malloc(sizeof(FssDynCell) * totalCells);
-  if( aCells == NULL ) return FSS_ERROR;
-
-  FssValue vals[FSS_MAX_COLUMNS];
-  for( uint16_t i = 0; i < count; i++ ){
-    int64_t rid;
-    fssPageGetRow(pPage, i, &rid, vals, FSS_MAX_COLUMNS);
-    fssEncodeSqliteCell(rid, vals, pPage->schema.num_columns, &aCells[i]);
-  }
-
-  if( pMismatchedValues != NULL ){
-    fssEncodeSqliteCell(mismatched_rowid, pMismatchedValues, nMismatchValues, &aCells[count]);
-  }
-
-  /* Sort cells in ascending order of rowid */
-  qsort(aCells, totalCells, sizeof(FssDynCell), compareCells);
 
   /* Clear the entire page from hdrOffset */
   uint8_t *aData = pPage->aData;
@@ -1411,18 +1719,103 @@ int fssPageDemoteToDynamic(
   aData[hdrOffset + 7] = 0;
 
   /* Write cells from bottom of page upwards */
-  uint16_t contentOffset = (uint16_t)pPage->pageSize;
-  uint16_t cellPtrOffset = hdrOffset + 8;
+  uint32_t contentOffset = pPage->pageSize;
+  uint32_t cellPtrOffset = hdrOffset + 8;
 
   for( uint16_t i = 0; i < totalCells; i++ ){
     contentOffset -= aCells[i].cellSize;
     memcpy(aData + contentOffset, aCells[i].aData, aCells[i].cellSize);
-    fssPutU16(aData + cellPtrOffset + i * 2, contentOffset);
+    fssPutU16(aData + cellPtrOffset + i * 2, (uint16_t)contentOffset);
+    fssFreeDynCell(&aCells[i]);
   }
 
   /* Update start of cell content area in header */
-  fssPutU16(aData + hdrOffset + 5, contentOffset);
+  fssPutU16(aData + hdrOffset + 5,
+            (uint16_t)(contentOffset == 65536 ? 0 : contentOffset));
 
   free(aCells);
   return FSS_OK;
 }
+
+/*
+** Validate the FSS database compatibility marker in the 100-byte SQLite header.
+** If aDbHdr is null, returns FSS_ERROR.
+** If bytes 72-79 are all zero, returns FSS_MARKER_NONE and sets *pVersion to 0 (if pVersion!=NULL).
+** If bytes 72-75 match "FSS1":
+**   reads big-endian 32-bit version into *pVersion (if pVersion!=NULL).
+**   if version == FSS_DB_VERSION, returns FSS_MARKER_VALID.
+**   else returns FSS_MARKER_UNSUPPORTED_VER.
+** If bytes 72-79 are non-zero but bytes 72-75 != "FSS1", returns FSS_MARKER_INVALID.
+*/
+int fssValidateDbMarker(const uint8_t *aDbHdr, uint32_t *pVersion){
+  const uint8_t *p;
+  uint32_t ver;
+  int allZero = 1;
+  int i;
+
+  if( !aDbHdr ) return FSS_ERROR;
+  p = aDbHdr + FSS_DB_MARKER_OFFSET;
+
+  for( i = 0; i < FSS_DB_MARKER_SIZE; i++ ){
+    if( p[i] != 0 ){
+      allZero = 0;
+      break;
+    }
+  }
+  if( allZero ){
+    if( pVersion ) *pVersion = 0;
+    return FSS_MARKER_NONE;
+  }
+
+  if( memcmp(p, FSS_DB_MAGIC, FSS_DB_MAGIC_SIZE) == 0 ){
+    ver = ((uint32_t)p[4] << 24) |
+          ((uint32_t)p[5] << 16) |
+          ((uint32_t)p[6] << 8)  |
+          ((uint32_t)p[7]);
+    if( pVersion ) *pVersion = ver;
+    if( ver == FSS_DB_VERSION ){
+      return FSS_MARKER_VALID;
+    }else{
+      return FSS_MARKER_UNSUPPORTED_VER;
+    }
+  }
+
+  if( pVersion ) *pVersion = 0;
+  return FSS_MARKER_INVALID;
+}
+
+/*
+** Write the FSS database compatibility marker into the 100-byte SQLite header.
+** Writes "FSS1" at offset 72 and the 32-bit big-endian version at offset 76.
+** Returns FSS_OK on success, or FSS_ERROR if aDbHdr is null.
+*/
+int fssWriteDbMarker(uint8_t *aDbHdr, uint32_t version){
+  uint8_t *p;
+  if( !aDbHdr ) return FSS_ERROR;
+  p = aDbHdr + FSS_DB_MARKER_OFFSET;
+  memcpy(p, FSS_DB_MAGIC, FSS_DB_MAGIC_SIZE);
+  p[4] = (uint8_t)((version >> 24) & 0xFF);
+  p[5] = (uint8_t)((version >> 16) & 0xFF);
+  p[6] = (uint8_t)((version >> 8) & 0xFF);
+  p[7] = (uint8_t)(version & 0xFF);
+  return FSS_OK;
+}
+
+/*
+** Clear the FSS database compatibility marker in the 100-byte SQLite header (sets bytes 72-79 to 0).
+** Returns FSS_OK on success, or FSS_ERROR if aDbHdr is null.
+*/
+int fssClearDbMarker(uint8_t *aDbHdr){
+  if( !aDbHdr ) return FSS_ERROR;
+  memset(aDbHdr + FSS_DB_MARKER_OFFSET, 0, FSS_DB_MARKER_SIZE);
+  return FSS_OK;
+}
+
+/*
+** Returns 1 if aDbHdr has the "FSS1" magic at offset 72, 0 otherwise.
+*/
+int fssHasDbMarker(const uint8_t *aDbHdr){
+  if( !aDbHdr ) return 0;
+  return (memcmp(aDbHdr + FSS_DB_MARKER_OFFSET, FSS_DB_MAGIC, FSS_DB_MAGIC_SIZE) == 0);
+}
+

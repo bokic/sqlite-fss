@@ -72,7 +72,7 @@ gcc -O2 -I"${SCRIPT_DIR}/src" \
 
 # 4b. PRAGMA syntax and gating test suite
 gcc -O2 -I"${SCRIPT_DIR}/src" -I"${SQLITE_DIR}" \
-    "${SCRIPT_DIR}/test/test_fss_pragma.c" "${SQLITE_DIR}/sqlite3.o" \
+    "${SCRIPT_DIR}/test/test_fss_pragma.c" "${SCRIPT_DIR}/src/fss.c" "${SQLITE_DIR}/sqlite3.o" \
     -lpthread -ldl -lm \
     -o "${SCRIPT_DIR}/bin/test_fss_pragma"
 
