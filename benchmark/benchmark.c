@@ -23,6 +23,7 @@
 #include "fss.h"
 
 #define NUM_ROWS 1000000
+#define NUM_RUNS 3
 #define PAGE_SIZE 4096
 
 static double get_time_sec(void) {
@@ -92,89 +93,103 @@ int main(void) {
 
   sqlite3 *dbStd = NULL;
   sqlite3 *dbFss = NULL;
+  int rc;
+  double t0;
 
   /* -------------------------------------------------------------------------
-  ** 1. INSERT BENCHMARK
+  ** 1. INSERT BENCHMARK (Best of NUM_RUNS)
   ** ------------------------------------------------------------------------- */
-  printf("[1/4] Benchmarking %d INSERT operations...\n", NUM_ROWS);
+  printf("[1/4] Benchmarking %d INSERT operations (Running %d times, taking best value)...\n", NUM_ROWS, NUM_RUNS);
+  double bestFssInsertTime = 1e9, bestStdInsertTime = 1e9;
 
-  /* Benchmark FSS INSERT */
-  int rc = sqlite3_open(fssDbPath, &dbFss);
-  assert(rc == SQLITE_OK);
-  sqlite3_exec(dbFss, "PRAGMA page_size = 4096;", NULL, NULL, NULL);
-  sqlite3_exec(dbFss, "PRAGMA synchronous = OFF;", NULL, NULL, NULL);
-  sqlite3_exec(dbFss, "PRAGMA journal_mode = MEMORY;", NULL, NULL, NULL);
-  rc = sqlite3_exec(dbFss, "PRAGMA fixed_schema = ON;", NULL, NULL, NULL);
-  assert(rc == SQLITE_OK);
+  for (int r = 1; r <= NUM_RUNS; r++) {
+    remove(stdDbPath);
+    remove(fssDbPath);
 
-  sqlite3_exec(dbFss,
-    "CREATE TABLE sensor_readings(timestamp INT64 NOT NULL, sensor_id INT32 NOT NULL, reading DOUBLE NOT NULL, status INT32 NOT NULL);",
-    NULL, NULL, NULL
-  );
+    /* Benchmark FSS INSERT */
+    rc = sqlite3_open(fssDbPath, &dbFss);
+    assert(rc == SQLITE_OK);
+    sqlite3_exec(dbFss, "PRAGMA page_size = 4096;", NULL, NULL, NULL);
+    sqlite3_exec(dbFss, "PRAGMA synchronous = OFF;", NULL, NULL, NULL);
+    sqlite3_exec(dbFss, "PRAGMA journal_mode = MEMORY;", NULL, NULL, NULL);
+    rc = sqlite3_exec(dbFss, "PRAGMA fixed_schema = ON;", NULL, NULL, NULL);
+    assert(rc == SQLITE_OK);
 
-  sqlite3_stmt *stmtInsertFss;
-  rc = sqlite3_prepare_v2(dbFss,
-    "INSERT INTO sensor_readings(rowid, timestamp, sensor_id, reading, status) VALUES (?, ?, ?, ?, ?);",
-    -1, &stmtInsertFss, NULL
-  );
-  assert(rc == SQLITE_OK);
+    sqlite3_exec(dbFss,
+      "CREATE TABLE sensor_readings(timestamp INT64 NOT NULL, sensor_id INT32 NOT NULL, reading DOUBLE NOT NULL, status INT32 NOT NULL);",
+      NULL, NULL, NULL
+    );
 
-  sqlite3_exec(dbFss, "BEGIN TRANSACTION;", NULL, NULL, NULL);
-  double t1 = get_time_sec();
-  for (int i = 1; i <= NUM_ROWS; i++) {
-    sqlite3_bind_int64(stmtInsertFss, 1, i);
-    sqlite3_bind_int64(stmtInsertFss, 2, 1728123000000LL + (int64_t)i * 1000LL);
-    sqlite3_bind_int(stmtInsertFss, 3, 100000 + (i % 250));
-    sqlite3_bind_double(stmtInsertFss, 4, 20.0 + (i % 100) * 0.25);
-    sqlite3_bind_int(stmtInsertFss, 5, 50000 + (i % 10));
-    sqlite3_step(stmtInsertFss);
-    sqlite3_reset(stmtInsertFss);
+    sqlite3_stmt *stmtInsertFss;
+    rc = sqlite3_prepare_v2(dbFss,
+      "INSERT INTO sensor_readings(rowid, timestamp, sensor_id, reading, status) VALUES (?, ?, ?, ?, ?);",
+      -1, &stmtInsertFss, NULL
+    );
+    assert(rc == SQLITE_OK);
+
+    sqlite3_exec(dbFss, "BEGIN TRANSACTION;", NULL, NULL, NULL);
+    double t1 = get_time_sec();
+    for (int i = 1; i <= NUM_ROWS; i++) {
+      sqlite3_bind_int64(stmtInsertFss, 1, i);
+      sqlite3_bind_int64(stmtInsertFss, 2, 1728123000000LL + (int64_t)i * 1000LL);
+      sqlite3_bind_int(stmtInsertFss, 3, 100000 + (i % 250));
+      sqlite3_bind_double(stmtInsertFss, 4, 20.0 + (i % 100) * 0.25);
+      sqlite3_bind_int(stmtInsertFss, 5, 50000 + (i % 10));
+      sqlite3_step(stmtInsertFss);
+      sqlite3_reset(stmtInsertFss);
+    }
+    sqlite3_exec(dbFss, "COMMIT;", NULL, NULL, NULL);
+    double fssInsertTime = get_time_sec() - t1;
+    sqlite3_finalize(stmtInsertFss);
+    sqlite3_close(dbFss);
+    if (fssInsertTime < bestFssInsertTime) bestFssInsertTime = fssInsertTime;
+
+    /* Benchmark Standard SQLite INSERT */
+    rc = sqlite3_open(stdDbPath, &dbStd);
+    assert(rc == SQLITE_OK);
+    sqlite3_exec(dbStd, "PRAGMA page_size = 4096;", NULL, NULL, NULL);
+    sqlite3_exec(dbStd, "PRAGMA synchronous = OFF;", NULL, NULL, NULL);
+    sqlite3_exec(dbStd, "PRAGMA journal_mode = MEMORY;", NULL, NULL, NULL);
+    rc = sqlite3_exec(dbStd, "PRAGMA fixed_schema = OFF;", NULL, NULL, NULL);
+    assert(rc == SQLITE_OK);
+    sqlite3_exec(dbStd,
+      "CREATE TABLE sensor_readings(timestamp INT64 NOT NULL, sensor_id INT32 NOT NULL, reading DOUBLE NOT NULL, status INT32 NOT NULL);",
+      NULL, NULL, NULL
+    );
+
+    sqlite3_stmt *stmtInsertStd;
+    rc = sqlite3_prepare_v2(dbStd,
+      "INSERT INTO sensor_readings(rowid, timestamp, sensor_id, reading, status) VALUES (?, ?, ?, ?, ?);",
+      -1, &stmtInsertStd, NULL
+    );
+    assert(rc == SQLITE_OK);
+
+    sqlite3_exec(dbStd, "BEGIN TRANSACTION;", NULL, NULL, NULL);
+    double t0 = get_time_sec();
+    for (int i = 1; i <= NUM_ROWS; i++) {
+      sqlite3_bind_int64(stmtInsertStd, 1, i);
+      sqlite3_bind_int64(stmtInsertStd, 2, 1728123000000LL + (int64_t)i * 1000LL);
+      sqlite3_bind_int(stmtInsertStd, 3, 100000 + (i % 250));
+      sqlite3_bind_double(stmtInsertStd, 4, 20.0 + (i % 100) * 0.25);
+      sqlite3_bind_int(stmtInsertStd, 5, 50000 + (i % 10));
+      sqlite3_step(stmtInsertStd);
+      sqlite3_reset(stmtInsertStd);
+    }
+    sqlite3_exec(dbStd, "COMMIT;", NULL, NULL, NULL);
+    double stdInsertTime = get_time_sec() - t0;
+    sqlite3_finalize(stmtInsertStd);
+    sqlite3_close(dbStd);
+    if (stdInsertTime < bestStdInsertTime) bestStdInsertTime = stdInsertTime;
+
+    printf("  Run %d/%d: Standard = %.4f s (%ld ops/sec) | FSS = %.4f s (%ld ops/sec) [%.1fx speedup]\n",
+           r, NUM_RUNS, stdInsertTime, (long)(NUM_ROWS / stdInsertTime),
+           fssInsertTime, (long)(NUM_ROWS / fssInsertTime), stdInsertTime / fssInsertTime);
   }
-  sqlite3_exec(dbFss, "COMMIT;", NULL, NULL, NULL);
-  double fssInsertTime = get_time_sec() - t1;
-  sqlite3_finalize(stmtInsertFss);
-  sqlite3_close(dbFss);
 
-  /* Benchmark Standard SQLite INSERT */
-  rc = sqlite3_open(stdDbPath, &dbStd);
-  assert(rc == SQLITE_OK);
-  sqlite3_exec(dbStd, "PRAGMA page_size = 4096;", NULL, NULL, NULL);
-  sqlite3_exec(dbStd, "PRAGMA synchronous = OFF;", NULL, NULL, NULL);
-  sqlite3_exec(dbStd, "PRAGMA journal_mode = MEMORY;", NULL, NULL, NULL);
-  rc = sqlite3_exec(dbStd, "PRAGMA fixed_schema = OFF;", NULL, NULL, NULL);
-  assert(rc == SQLITE_OK);
-  sqlite3_exec(dbStd,
-    "CREATE TABLE sensor_readings(timestamp INT64 NOT NULL, sensor_id INT32 NOT NULL, reading DOUBLE NOT NULL, status INT32 NOT NULL);",
-    NULL, NULL, NULL
-  );
-
-  sqlite3_stmt *stmtInsertStd;
-  rc = sqlite3_prepare_v2(dbStd,
-    "INSERT INTO sensor_readings(rowid, timestamp, sensor_id, reading, status) VALUES (?, ?, ?, ?, ?);",
-    -1, &stmtInsertStd, NULL
-  );
-  assert(rc == SQLITE_OK);
-
-  sqlite3_exec(dbStd, "BEGIN TRANSACTION;", NULL, NULL, NULL);
-  double t0 = get_time_sec();
-  for (int i = 1; i <= NUM_ROWS; i++) {
-    sqlite3_bind_int64(stmtInsertStd, 1, i);
-    sqlite3_bind_int64(stmtInsertStd, 2, 1728123000000LL + (int64_t)i * 1000LL);
-    sqlite3_bind_int(stmtInsertStd, 3, 100000 + (i % 250));
-    sqlite3_bind_double(stmtInsertStd, 4, 20.0 + (i % 100) * 0.25);
-    sqlite3_bind_int(stmtInsertStd, 5, 50000 + (i % 10));
-    sqlite3_step(stmtInsertStd);
-    sqlite3_reset(stmtInsertStd);
-  }
-  sqlite3_exec(dbStd, "COMMIT;", NULL, NULL, NULL);
-  double stdInsertTime = get_time_sec() - t0;
-  sqlite3_finalize(stmtInsertStd);
-  sqlite3_close(dbStd);
-
-  printf("  -> Standard SQLite: %.4f s (%ld ops/sec)\n",
-         stdInsertTime, (long)(NUM_ROWS / stdInsertTime));
-  printf("  -> FSS Storage:     %.4f s (%ld ops/sec) [%.1fx speedup]\n\n",
-         fssInsertTime, (long)(NUM_ROWS / fssInsertTime), stdInsertTime / fssInsertTime);
+  printf("  -> BEST Standard SQLite: %.4f s (%ld ops/sec)\n",
+         bestStdInsertTime, (long)(NUM_ROWS / bestStdInsertTime));
+  printf("  -> BEST FSS Storage:     %.4f s (%ld ops/sec) [%.1fx speedup]\n\n",
+         bestFssInsertTime, (long)(NUM_ROWS / bestFssInsertTime), bestStdInsertTime / bestFssInsertTime);
 
   /* -------------------------------------------------------------------------
   ** 2. DISK USAGE COMPARISON
@@ -210,9 +225,9 @@ int main(void) {
   assert(countFssLeaves > 0); /* Fail if expected FSS leaves are absent! */
 
   /* -------------------------------------------------------------------------
-  ** 3. SELECT BENCHMARK (10,000 Point Lookups + Full Scan)
+  ** 3. SELECT BENCHMARK (Point Lookups, Best of NUM_RUNS)
   ** ------------------------------------------------------------------------- */
-  printf("[3/4] Benchmarking %d SELECT operations...\n", NUM_ROWS);
+  printf("[3/4] Benchmarking %d SELECT operations (Running %d times, taking best value)...\n", NUM_ROWS, NUM_RUNS);
 
   rc = sqlite3_open(stdDbPath, &dbStd);
   assert(rc == SQLITE_OK);
@@ -231,16 +246,6 @@ int main(void) {
   );
   assert(rc == SQLITE_OK);
 
-  t0 = get_time_sec();
-  for (int i = 1; i <= NUM_ROWS; i++) {
-    sqlite3_bind_int64(stmtSelectStd, 1, i);
-    rc = sqlite3_step(stmtSelectStd);
-    assert(rc == SQLITE_ROW);
-    sqlite3_reset(stmtSelectStd);
-  }
-  double stdSelectTime = get_time_sec() - t0;
-  sqlite3_finalize(stmtSelectStd);
-
   /* Point Lookups on FSS */
   sqlite3_stmt *stmtSelectFss;
   rc = sqlite3_prepare_v2(dbFss,
@@ -249,30 +254,48 @@ int main(void) {
   );
   assert(rc == SQLITE_OK);
 
-  t0 = get_time_sec();
-  for (int i = 1; i <= NUM_ROWS; i++) {
-    sqlite3_bind_int64(stmtSelectFss, 1, i);
-    rc = sqlite3_step(stmtSelectFss);
-    assert(rc == SQLITE_ROW);
-    sqlite3_reset(stmtSelectFss);
+  double bestStdSelectTime = 1e9, bestFssSelectTime = 1e9;
+  for (int r = 1; r <= NUM_RUNS; r++) {
+    t0 = get_time_sec();
+    for (int i = 1; i <= NUM_ROWS; i++) {
+      sqlite3_bind_int64(stmtSelectStd, 1, i);
+      rc = sqlite3_step(stmtSelectStd);
+      assert(rc == SQLITE_ROW);
+      sqlite3_reset(stmtSelectStd);
+    }
+    double stdSelectTime = get_time_sec() - t0;
+    if (stdSelectTime < bestStdSelectTime) bestStdSelectTime = stdSelectTime;
+
+    t0 = get_time_sec();
+    for (int i = 1; i <= NUM_ROWS; i++) {
+      sqlite3_bind_int64(stmtSelectFss, 1, i);
+      rc = sqlite3_step(stmtSelectFss);
+      assert(rc == SQLITE_ROW);
+      sqlite3_reset(stmtSelectFss);
+    }
+    double fssSelectTime = get_time_sec() - t0;
+    if (fssSelectTime < bestFssSelectTime) bestFssSelectTime = fssSelectTime;
+
+    printf("  Run %d/%d: Standard = %.4f s (%ld queries/sec) | FSS = %.4f s (%ld queries/sec) [%.1fx speedup]\n",
+           r, NUM_RUNS, stdSelectTime, (long)(NUM_ROWS / stdSelectTime),
+           fssSelectTime, (long)(NUM_ROWS / fssSelectTime), stdSelectTime / fssSelectTime);
   }
-  double fssSelectTime = get_time_sec() - t0;
+  sqlite3_finalize(stmtSelectStd);
   sqlite3_finalize(stmtSelectFss);
 
-  printf("  -> Standard SQLite: %.4f s (%ld queries/sec)\n",
-         stdSelectTime, (long)(NUM_ROWS / stdSelectTime));
-  printf("  -> FSS Storage:     %.4f s (%ld queries/sec) [%.1fx speedup]\n\n",
-         fssSelectTime, (long)(NUM_ROWS / fssSelectTime), stdSelectTime / fssSelectTime);
+  printf("  -> BEST Standard SQLite: %.4f s (%ld queries/sec)\n",
+         bestStdSelectTime, (long)(NUM_ROWS / bestStdSelectTime));
+  printf("  -> BEST FSS Storage:     %.4f s (%ld queries/sec) [%.1fx speedup]\n\n",
+         bestFssSelectTime, (long)(NUM_ROWS / bestFssSelectTime), bestStdSelectTime / bestFssSelectTime);
 
   /* -------------------------------------------------------------------------
-  ** 4. UPDATE BENCHMARK (1,000,000 Updates)
+  ** 4. UPDATE BENCHMARK (1,000,000 Updates, Best of NUM_RUNS)
   ** ------------------------------------------------------------------------- */
-  printf("[4/4] Benchmarking %d UPDATE operations...\n", NUM_ROWS);
+  printf("[4/4] Benchmarking %d UPDATE operations (Running %d times, taking best value)...\n", NUM_ROWS, NUM_RUNS);
 
   /*
   ** Both implementations run the same prepared SQL UPDATE workload, in one
-  ** transaction. Keep the connection open and check every SQLite result so
-  ** an unsupported or skipped FSS update cannot appear as fast throughput.
+  ** transaction per run.
   */
   assert(sqlite3_exec(dbStd, "PRAGMA synchronous = OFF;", NULL, NULL, NULL) == SQLITE_OK);
   assert(sqlite3_exec(dbStd, "PRAGMA journal_mode = MEMORY;", NULL, NULL, NULL) == SQLITE_OK);
@@ -292,38 +315,47 @@ int main(void) {
   );
   assert(rc == SQLITE_OK);
 
-  rc = sqlite3_exec(dbStd, "BEGIN TRANSACTION;", NULL, NULL, NULL);
-  assert(rc == SQLITE_OK);
-  t0 = get_time_sec();
-  for (int i = 1; i <= NUM_ROWS; i++) {
-    assert(sqlite3_bind_int64(stmtUpdateStd, 1, i) == SQLITE_OK);
-    rc = sqlite3_step(stmtUpdateStd);
-    assert(rc == SQLITE_DONE);
-    assert(sqlite3_changes(dbStd) == 1);
-    assert(sqlite3_reset(stmtUpdateStd) == SQLITE_OK);
-  }
-  assert(sqlite3_exec(dbStd, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK);
-  double stdUpdateTime = get_time_sec() - t0;
-  sqlite3_finalize(stmtUpdateStd);
+  double bestStdUpdateTime = 1e9, bestFssUpdateTime = 1e9;
+  for (int r = 1; r <= NUM_RUNS; r++) {
+    rc = sqlite3_exec(dbStd, "BEGIN TRANSACTION;", NULL, NULL, NULL);
+    assert(rc == SQLITE_OK);
+    t0 = get_time_sec();
+    for (int i = 1; i <= NUM_ROWS; i++) {
+      assert(sqlite3_bind_int64(stmtUpdateStd, 1, i) == SQLITE_OK);
+      rc = sqlite3_step(stmtUpdateStd);
+      assert(rc == SQLITE_DONE);
+      assert(sqlite3_changes(dbStd) == 1);
+      assert(sqlite3_reset(stmtUpdateStd) == SQLITE_OK);
+    }
+    assert(sqlite3_exec(dbStd, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK);
+    double stdUpdateTime = get_time_sec() - t0;
+    if (stdUpdateTime < bestStdUpdateTime) bestStdUpdateTime = stdUpdateTime;
 
-  rc = sqlite3_exec(dbFss, "BEGIN TRANSACTION;", NULL, NULL, NULL);
-  assert(rc == SQLITE_OK);
-  t0 = get_time_sec();
-  for (int i = 1; i <= NUM_ROWS; i++) {
-    assert(sqlite3_bind_int64(stmtUpdateFss, 1, i) == SQLITE_OK);
-    rc = sqlite3_step(stmtUpdateFss);
-    assert(rc == SQLITE_DONE);
-    assert(sqlite3_changes(dbFss) == 1);
-    assert(sqlite3_reset(stmtUpdateFss) == SQLITE_OK);
+    rc = sqlite3_exec(dbFss, "BEGIN TRANSACTION;", NULL, NULL, NULL);
+    assert(rc == SQLITE_OK);
+    t0 = get_time_sec();
+    for (int i = 1; i <= NUM_ROWS; i++) {
+      assert(sqlite3_bind_int64(stmtUpdateFss, 1, i) == SQLITE_OK);
+      rc = sqlite3_step(stmtUpdateFss);
+      assert(rc == SQLITE_DONE);
+      assert(sqlite3_changes(dbFss) == 1);
+      assert(sqlite3_reset(stmtUpdateFss) == SQLITE_OK);
+    }
+    assert(sqlite3_exec(dbFss, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK);
+    double fssUpdateTime = get_time_sec() - t0;
+    if (fssUpdateTime < bestFssUpdateTime) bestFssUpdateTime = fssUpdateTime;
+
+    printf("  Run %d/%d: Standard = %.4f s (%ld updates/sec) | FSS = %.4f s (%ld updates/sec) [%.1fx speedup]\n",
+           r, NUM_RUNS, stdUpdateTime, (long)(NUM_ROWS / stdUpdateTime),
+           fssUpdateTime, (long)(NUM_ROWS / fssUpdateTime), stdUpdateTime / fssUpdateTime);
   }
-  assert(sqlite3_exec(dbFss, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK);
-  double fssUpdateTime = get_time_sec() - t0;
+  sqlite3_finalize(stmtUpdateStd);
   sqlite3_finalize(stmtUpdateFss);
 
-  printf("  -> Standard SQLite: %.4f s (%ld updates/sec)\n",
-         stdUpdateTime, (long)(NUM_ROWS / stdUpdateTime));
-  printf("  -> FSS Storage:     %.4f s (%ld updates/sec) [%.1fx speedup]\n\n",
-         fssUpdateTime, (long)(NUM_ROWS / fssUpdateTime), stdUpdateTime / fssUpdateTime);
+  printf("  -> BEST Standard SQLite: %.4f s (%ld updates/sec)\n",
+         bestStdUpdateTime, (long)(NUM_ROWS / bestStdUpdateTime));
+  printf("  -> BEST FSS Storage:     %.4f s (%ld updates/sec) [%.1fx speedup]\n\n",
+         bestFssUpdateTime, (long)(NUM_ROWS / bestFssUpdateTime), bestStdUpdateTime / bestFssUpdateTime);
 
   /* -------------------------------------------------------------------------
   ** 5. DATA CORRECTNESS VERIFICATION
@@ -362,10 +394,10 @@ int main(void) {
   sqlite3_close(dbFss);
 
   /* -------------------------------------------------------------------------
-  ** EXECUTIVE SUMMARY
+  ** EXECUTIVE SUMMARY (Best of 3 Runs)
   ** ------------------------------------------------------------------------- */
   printf("=======================================================================\n");
-  printf(" EXECUTIVE BENCHMARK SUMMARY\n");
+  printf(" EXECUTIVE BENCHMARK SUMMARY (BEST OF %d RUNS)\n", NUM_RUNS);
   printf("=======================================================================\n");
   printf(" Metric                    | Standard SQLite   | FSS Storage       | Gain\n");
   printf(" --------------------------+-------------------+-------------------+----------\n");
@@ -374,11 +406,11 @@ int main(void) {
   printf(" Total 4KB Pages Allocated | %10ld pages   | %10ld pages   | -%ld pages\n",
          stdPages, fssPages, stdPages - fssPages);
   printf(" INSERT Throughput         | %10ld ops/s   | %10ld ops/s   | %.1fx FASTER\n",
-         (long)(NUM_ROWS / stdInsertTime), (long)(NUM_ROWS / fssInsertTime), stdInsertTime / fssInsertTime);
+         (long)(NUM_ROWS / bestStdInsertTime), (long)(NUM_ROWS / bestFssInsertTime), bestStdInsertTime / bestFssInsertTime);
   printf(" SELECT Throughput         | %10ld ops/s   | %10ld ops/s   | %.1fx FASTER\n",
-         (long)(NUM_ROWS / stdSelectTime), (long)(NUM_ROWS / fssSelectTime), stdSelectTime / fssSelectTime);
+         (long)(NUM_ROWS / bestStdSelectTime), (long)(NUM_ROWS / bestFssSelectTime), bestStdSelectTime / bestFssSelectTime);
   printf(" UPDATE Throughput         | %10ld ops/s   | %10ld ops/s   | %.1fx FASTER\n",
-         (long)(NUM_ROWS / stdUpdateTime), (long)(NUM_ROWS / fssUpdateTime), stdUpdateTime / fssUpdateTime);
+         (long)(NUM_ROWS / bestStdUpdateTime), (long)(NUM_ROWS / bestFssUpdateTime), bestStdUpdateTime / bestFssUpdateTime);
   printf("=======================================================================\n");
 
   return 0;

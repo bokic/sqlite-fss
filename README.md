@@ -120,7 +120,7 @@ The repository includes a turnkey `build.sh` script that:
 
 ---
 
-## 📈 Benchmark Results (1,000,000 Records)
+## 📈 Benchmark Results (1,000,000 Records, Best of 3 Runs)
 
 Workload: 1,000,000 structured IoT/Sensor records with schema `(timestamp INT64, sensor_id INT32, reading FLOAT64, status INT32)` inside an explicit transaction (`PRAGMA page_size = 4096`, `synchronous = OFF`, `journal_mode = MEMORY`).
 
@@ -128,9 +128,9 @@ Workload: 1,000,000 structured IoT/Sensor records with schema `(timestamp INT64,
 |---|---|---|---|
 | **Database File Size** | **29,536,256 bytes** | **24,453,120 bytes** | **-17.21% SPACE (-5,083,136 bytes saved)** |
 | **Total 4KB Pages Allocated** | 7,211 pages | 5,970 pages (5,953 FSS leaves, 16 interior) | **-1,241 pages saved** |
-| **INSERT Throughput** | ~3,200,000 ops/sec | ~2,980,000 ops/sec | **0.93x (Direct single-pass slot streaming)** |
-| **SELECT Point Lookups** | ~190,000 queries/sec | ~191,000 queries/sec | **1.01x FASTER ($O(1)$ direct slot math, zero varints)** |
-| **UPDATE In-Place Throughput** | ~2,900,000 updates/sec | ~2,650,000 updates/sec | **0.92x (Near parity via cursor slot overwrite)** |
+| **INSERT Throughput** | ~3,222,000 ops/sec | ~2,932,000 ops/sec | **0.91x (Direct single-pass slot streaming)** |
+| **SELECT Point Lookups** | ~191,500 queries/sec | ~192,600 queries/sec | **1.01x FASTER ($O(1)$ direct slot math, zero varints)** |
+| **UPDATE In-Place Throughput** | ~3,030,000 updates/sec | ~2,782,000 updates/sec | **0.92x (Near parity via cursor slot overwrite)** |
 | **Data Consistency** | 1,000,000 rows | 1,000,000 rows | **100% Match Verified (`integrity_check` ok)** |
 
 ---
