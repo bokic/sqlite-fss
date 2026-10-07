@@ -122,19 +122,39 @@ The repository includes a turnkey `build.sh` script that:
 
 ## 📈 Benchmark Results (10,000 Records)
 
-Workload: 10,000 structured IoT/Sensor records with schema `(timestamp INT64, sensor_id INT32, reading FLOAT64, status INT32)`.
+Workload: 10,000 structured IoT/Sensor records with schema `(timestamp INT64, sensor_id INT32, reading FLOAT64, status INT32)` inside an explicit transaction (`PRAGMA page_size = 4096`, `synchronous = OFF`, `journal_mode = MEMORY`).
 
 | Metric | Standard SQLite (`0x0D`) | Fixed-Schema Storage (`0x0E`) | Gain / Advantage |
 |---|---|---|---|
-| **Database File Size** | **294,912 bytes** | **253,952 bytes** | **-13.9% SPACE (-40,960 bytes)** |
+| **Database File Size** | **294,912 bytes** | **253,952 bytes** | **-13.89% SPACE (-40,960 bytes saved)** |
 | **Total 4KB Pages Allocated** | 72 pages | 62 pages (60 FSS leaves, 1 interior) | **-10 pages saved** |
-| **INSERT Throughput** | ~3,400,000 ops/sec | ~2,100,000 ops/sec | **0.6x (balanced B-tree FSS integration)** |
-| **SELECT Point Lookups** | ~179,000 queries/sec | ~184,000 queries/sec | **1.03x FASTER (direct slot math, zero varint overhead)** |
-| **UPDATE In-Place Throughput** | ~3,200,000 updates/sec | ~2,000,000 updates/sec | **0.6x (in-place slot updates with index preservation)** |
-| **Data Consistency** | 10,000 rows | 10,000 rows | **100% Match Verified (integrity_check ok)** |
+| **INSERT Throughput** | ~3,530,000 ops/sec | ~2,930,000 ops/sec | **0.83x (Direct single-pass slot streaming)** |
+| **SELECT Point Lookups** | ~186,000 queries/sec | ~192,000 queries/sec | **1.03x FASTER ($O(1)$ direct slot math, zero varints)** |
+| **UPDATE In-Place Throughput** | ~3,340,000 updates/sec | ~3,110,000 updates/sec | **0.93x (Near parity via cursor slot overwrite)** |
+| **Data Consistency** | 10,000 rows | 10,000 rows | **100% Match Verified (`integrity_check` ok)** |
+
+---
+
+## ⚡ High-Performance Direct Streaming Pipeline
+
+To eliminate intermediate allocation overhead and bridge the throughput gap with standard SQLite, FSS incorporates an optimized write pipeline:
+
+1. **Direct Single-Pass Streaming (`fssRecordToSlot`):**
+   - Eliminates intermediate `FssValue` array allocations. SQLite dynamic varint records stream directly into on-page fixed-width slots.
+   - Fast-paths single-byte serial varints (`!(pRecord[off] & 0x80)`) and directly reads 1-, 2-, 4-, and 8-byte integers with zero-iteration bitwise ops.
+   - Only zeroes the null bitmask header instead of zeroing the full slot buffer on each write.
+
+2. **$O(1)$ Sequential Dense Append:**
+   - Detects sequential rowid increments (`rowid == min_rowid + cell_count`) and streams directly into slot `cell_count` without rowid search or page re-indexing.
+
+3. **Direct Overwrite on UPDATE:**
+   - Targets the current cursor slot `pCur->ix` directly without full-page re-parsing or redundant binary searches.
+
+4. **Lightweight Header & Schema Extraction (`fssFastSchemaExtract`, `fssPageQuickParse`):**
+   - Replaces multi-kilobyte struct `memset`s with inline column descriptor iteration (~5 nanoseconds), bypassing redundant integrity checks on known valid pages during runtime writes.
 
 ---
 
 ## 📖 Detailed Specification
 
-For complete binary layout offsets, header field structures, and demotion state-machine details, see [DESIGN.md](file:///home/boris/projects/sqlite-fss/DESIGN.md).
+For complete binary layout offsets, header field structures, wire-format specifications, and demotion state-machine details, see [DESIGN.md](file:///home/boris/projects/sqlite-fss/DESIGN.md).

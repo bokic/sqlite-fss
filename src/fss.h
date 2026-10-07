@@ -264,6 +264,22 @@ void fssWriteSlot(
 );
 
 /*
+** Direct conversion from raw SQLite record bytes into a fixed-width slot.
+** Validates types, widths, and NOT NULL constraints in a single pass.
+** Returns FSS_OK on success,
+**         FSS_CORRUPT if record payload is malformed,
+**         FSS_TYPE_MISMATCH if values do not conform to schema.
+*/
+FSS_API 
+int fssRecordToSlot(
+  const uint8_t *pRecord,
+  uint32_t nRecord,
+  const FssSchema *pSchema,
+  uint8_t pageFlags,
+  uint8_t *pSlot
+);
+
+/*
 ** Initialize an FSS page with the schema and the initial row (N=1).
 ** Invariant: An FSS chunk is never instantiated with 0 rows.
 */
@@ -277,6 +293,22 @@ int fssPageInit(
   uint8_t flags,
   int64_t initial_rowid,
   const FssValue *pInitialValues
+);
+
+/*
+** Initialize an FSS page with the schema and the initial row directly from SQLite record bytes.
+*/
+FSS_API 
+int fssPageInitRecord(
+  uint8_t *aData,
+  uint32_t pageSize,
+  uint16_t hdrOffset,
+  const FssFieldDesc *pCols,
+  uint16_t nCols,
+  uint8_t flags,
+  int64_t initial_rowid,
+  const uint8_t *pRecord,
+  uint32_t nRecord
 );
 
 /*
@@ -315,6 +347,37 @@ int fssPageInsert(
   int64_t rowid,
   const FssValue *pValues,
   uint16_t nValues
+);
+
+/*
+** Direct insert from raw SQLite record bytes into an FSS page.
+** Avoids intermediate FssValue unpacking and performs single-pass write.
+** If pOutSlot is non-NULL, stores the target slot index where row was placed.
+*/
+FSS_API 
+int fssPageInsertRecord(
+  FssPage *pPage,
+  int64_t rowid,
+  const uint8_t *pRecord,
+  uint32_t nRecord,
+  uint16_t *pOutSlot
+);
+
+/*
+** Fast schema extraction directly from the page header without full page validation.
+*/
+FSS_API 
+int fssFastSchemaExtract(const uint8_t *pHdr, FssSchema *pSchema);
+
+/*
+** Lightweight parse of an initialized FSS page without deep structural checks.
+*/
+FSS_API 
+int fssPageQuickParse(
+  uint8_t *aData,
+  uint32_t pageSize,
+  uint16_t hdrOffset,
+  FssPage *pPage
 );
 
 /*
@@ -432,8 +495,31 @@ FSS_API
 FssValue fssValueNull(void);
 
 /*
-** 64-bit Big-Endian Integer serialization utilities.
+** Big-Endian integer serialization utilities.
 */
+static inline uint16_t fssGetU16(const uint8_t *p) {
+  return ((uint16_t)p[0] << 8) | (uint16_t)p[1];
+}
+
+static inline void fssPutU16(uint8_t *p, uint16_t v) {
+  p[0] = (uint8_t)(v >> 8);
+  p[1] = (uint8_t)(v & 0xff);
+}
+
+static inline uint32_t fssGetU32(const uint8_t *p) {
+  return ((uint32_t)p[0] << 24) |
+         ((uint32_t)p[1] << 16) |
+         ((uint32_t)p[2] << 8)  |
+         ((uint32_t)p[3]);
+}
+
+static inline void fssPutU32(uint8_t *p, uint32_t v) {
+  p[0] = (uint8_t)(v >> 24);
+  p[1] = (uint8_t)(v >> 16);
+  p[2] = (uint8_t)(v >> 8);
+  p[3] = (uint8_t)(v & 0xff);
+}
+
 static inline int64_t fssGetI64(const uint8_t *p) {
   uint64_t v = 0;
   for( int i = 0; i < 8; i++ ){
