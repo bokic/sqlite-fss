@@ -37,9 +37,13 @@ FSS Leaf Page (0x0E):
 
 ## 2. Advantages & Architectural Benefits
 
-1. **Self-Describing Yet Compact:**
+> [!NOTE]
+> **Primary Benefit & Performance Reality:**
+> The primary, measurable advantage of Fixed-Schema Storage is **smaller database file size (up to ~20% reduction)**. Latest empirical benchmarks confirm that FSS does **not** provide runtime performance gains over standard SQLite; operations run at near parity (~0.9x–1.0x). The architecture's purpose is achieving higher storage density without regressing SQLite's execution throughput.
+
+1. **Self-Describing Yet Compact (Up to ~20% Space Reduction):**
    - The page remains self-describing: readers can decode every row on the page using solely the field descriptor stored in that page's preamble, without querying the master schema catalog for every cell.
-   - Disk space and memory bandwidth consumption drop significantly (saving 2–8+ bytes of metadata *per row*).
+   - Eliminates redundant per-row varints, serial types, and cell-pointer arrays, saving 2–8+ bytes of metadata per row and reducing overall database file size by **up to ~20%** (-17.21% measured on 1M IoT records).
 2. **Predictable Row Size & Direct Offset Math:**
    - If all columns are fixed-width, row payload size is constant and mathematically predetermined:
      $$\text{RowPayloadSize} = \text{nullBytes} + \sum_{i=0}^{N-1} \text{width}(\text{col}_i)$$
@@ -47,8 +51,8 @@ FSS Leaf Page (0x0E):
      $$\text{ColOffset}(j, k) = \text{DataStart} + (j \times \text{RowPayloadSize}) + \text{ColRelativeOffset}(k)$$
 3. **Strict Minimum Invariant (1 or More Rows):**
    - An FSS page/chunk must always contain at least one data row ($1 \le N \le \text{capacity}$). An FSS chunk is never instantiated empty; it is created upon insertion of its first record. If deletions reduce the row count to zero ($N=0$), the page is freed/reclaimed or merged into sibling pages.
-4. **SIMD & Vectorization Friendly:**
-   - With known field offsets across rows, vectorized column filtering (e.g., comparing 8 integers at once using AVX2/NEON) becomes possible directly over page data.
+4. **Predictable Layout & Parity Throughput:**
+   - With fixed-width contiguous slots, row access avoids dynamic record header decoding. Because SQLite VDBE bytecode evaluation and cursor dispatch remain the primary execution cost, overall throughput operates on near parity (~0.9x–1.0x) with standard SQLite.
 5. **No Variable-Cell Defragmentation (for Fixed Widths):**
    - Rows occupy fixed-width slots and there are no freeblock chains. Inserts and deletes that are not at the end shift rowids and slots together to preserve key order.
 
@@ -340,7 +344,7 @@ Because standard `0x0D` records have per-cell overhead (varints, serial types, 2
 
 ### 6.4 Key Properties of this Strategy
 - **100% SQLite Semantics:** No query or transaction ever fails due to typing constraints. Flexible typing remains fully functional.
-- **Optimistic Performance:** Compliant, well-typed data enjoys maximal storage density and SIMD scan speed.
+- **Storage Density at Parity Performance:** Compliant, well-typed data achieves smaller file sizes (up to ~20% reduction) while maintaining runtime throughput on near-parity (~0.9x–1.0x) with standard SQLite.
 - **Graceful Degradation:** Tables degrade seamlessly to standard SQLite dynamic pages on an as-needed, page-by-page basis without rewriting the entire database.
 
 ---
@@ -385,8 +389,8 @@ CREATE TABLE sensor_readings (
   - *Total per cell:* $\approx 25\text{ bytes} + 2\text{ bytes pointer} = 27\text{ bytes}$.
   - Plus freeblock / fragmentation overhead.
 - **FSS delivers:**
-  - $\approx 20\text{--}25\%$ storage space savings.
-  - Instant direct indexing with zero runtime record-header parsing.
+  - **Up to ~20% storage space reduction** (-17.21% measured on 1,000,000 IoT records).
+  - Maintained performance parity (~0.9x–1.0x) with standard SQLite with zero runtime record-header parsing.
 
 ---
 
@@ -394,14 +398,15 @@ CREATE TABLE sensor_readings (
 
 | Feature | Standard Table Leaf (`0x0D`) | Fixed-Schema Leaf (`0x0E`) |
 |---|---|---|
+| **Database File Size** | Baseline (repeats type tags every row) | **Up to ~20% smaller (-17.2% measured)** |
+| **Runtime Performance** | Baseline (optimized dynamic format) | **Parity (~0.9x–1.0x; no performance gain)** |
 | **Schema Info** | Stored per-row (varint serial types) | Stored once in page header (`PageSchemaHeader`) |
 | **Row Count** | 0 or more cells | 1 or more data rows (chunk underflow reclaims page) |
 | **Cell Addressing** | 2-byte cell pointer array + variable cell offsets | Direct arithmetic / packed rowid array |
 | **Column Projection** | Sequential scan of varints to reach col $N$ | Direct offset: $O(1)$ pointer math |
 | **NULL Overhead** | 1 byte per column in record header | 1 bit per column (or 0 if `NOT NULL`) |
-| **Fragmentation** | Freeblocks + fragmented byte tracking | Fixed slots; ordered inserts/deletes may shift rows |
+| **Fragmentation** | Freeblocks + fragmented byte tracking | Fixed slots; no variable-cell freeblocks |
 | **Type Mismatch** | Native (accepts any type) | Morphs in-place to `0x0D` or splits into new node |
-| **SIMD / Vectorization** | Not feasible (variable cell layout) | Native support (contiguous fixed arrays) |
 
 ---
 
