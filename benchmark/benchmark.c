@@ -2,13 +2,13 @@
 ** SQLite Fixed-Schema Storage (FSS) vs. Standard SQLite Benchmark & Verification
 **
 ** This program:
-**  1. Creates and fills two SQLite databases with the same 10,000 records:
+**  1. Creates and fills two SQLite databases with the same 1,000,000 records:
 **     - standard.db (Standard SQLite dynamic leaf format 0x0D)
 **     - fss.db (Fixed-Schema Storage leaf format 0x0E)
 **  2. Compares disk usage (bytes and page counts) proving storage savings.
-**  3. Benchmarks 10,000 INSERT operations on both databases.
-**  4. Benchmarks 10,000 SELECT operations (point lookups and aggregates).
-**  5. Benchmarks 10,000 UPDATE operations on both databases.
+**  3. Benchmarks 1,000,000 INSERT operations on both databases.
+**  4. Benchmarks 1,000,000 SELECT operations (point lookups).
+**  5. Benchmarks 1,000,000 UPDATE operations on both databases.
 **  6. Verifies 100% data correctness across both databases.
 */
 
@@ -22,7 +22,7 @@
 #include "sqlite3.h"
 #include "fss.h"
 
-#define NUM_ROWS 10000
+#define NUM_ROWS 1000000
 #define PAGE_SIZE 4096
 
 static double get_time_sec(void) {
@@ -265,7 +265,7 @@ int main(void) {
          fssSelectTime, (long)(NUM_ROWS / fssSelectTime), stdSelectTime / fssSelectTime);
 
   /* -------------------------------------------------------------------------
-  ** 4. UPDATE BENCHMARK (10,000 Updates)
+  ** 4. UPDATE BENCHMARK (1,000,000 Updates)
   ** ------------------------------------------------------------------------- */
   printf("[4/4] Benchmarking %d UPDATE operations...\n", NUM_ROWS);
 
@@ -369,15 +369,15 @@ int main(void) {
   printf("=======================================================================\n");
   printf(" Metric                    | Standard SQLite   | FSS Storage       | Gain\n");
   printf(" --------------------------+-------------------+-------------------+----------\n");
-  printf(" Database File Size        | %7ld bytes   | %7ld bytes   | -%.1f%% SPACE\n",
+  printf(" Database File Size        | %10ld bytes   | %10ld bytes   | -%.1f%% SPACE\n",
          stdSize, fssSize, savingsPct);
-  printf(" Total 4KB Pages Allocated | %7ld pages   | %7ld pages   | -%ld pages\n",
+  printf(" Total 4KB Pages Allocated | %10ld pages   | %10ld pages   | -%ld pages\n",
          stdPages, fssPages, stdPages - fssPages);
-  printf(" INSERT Throughput         | %7ld ops/s   | %7ld ops/s   | %.1fx FASTER\n",
+  printf(" INSERT Throughput         | %10ld ops/s   | %10ld ops/s   | %.1fx FASTER\n",
          (long)(NUM_ROWS / stdInsertTime), (long)(NUM_ROWS / fssInsertTime), stdInsertTime / fssInsertTime);
-  printf(" SELECT Throughput         | %7ld ops/s   | %7ld ops/s   | %.1fx FASTER\n",
+  printf(" SELECT Throughput         | %10ld ops/s   | %10ld ops/s   | %.1fx FASTER\n",
          (long)(NUM_ROWS / stdSelectTime), (long)(NUM_ROWS / fssSelectTime), stdSelectTime / fssSelectTime);
-  printf(" UPDATE Throughput         | %7ld ops/s   | %7ld ops/s   | %.1fx FASTER\n",
+  printf(" UPDATE Throughput         | %10ld ops/s   | %10ld ops/s   | %.1fx FASTER\n",
          (long)(NUM_ROWS / stdUpdateTime), (long)(NUM_ROWS / fssUpdateTime), stdUpdateTime / fssUpdateTime);
   printf("=======================================================================\n");
 

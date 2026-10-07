@@ -110,7 +110,7 @@ The repository includes a turnkey `build.sh` script that:
 1. Clones/checks out upstream SQLite at commit `d54522a5b832422ab893a1e9fa7a99ab314ea4e2`.
 2. Applies the FSS patches (`patches/sqlite-fss.patch` and `src/fss.{c,h}`).
 3. Re-generates `pragma.h` and compiles SQLite amalgamation and binaries.
-4. Compiles standalone FSS unit tests, PRAGMA tests, and the 10,000-operation benchmark.
+4. Compiles standalone FSS unit tests, PRAGMA tests, and the 1,000,000-operation benchmark.
 5. Executes the test suite and prints the executive benchmark summary.
 
 ### Running the Build:
@@ -120,18 +120,18 @@ The repository includes a turnkey `build.sh` script that:
 
 ---
 
-## 📈 Benchmark Results (10,000 Records)
+## 📈 Benchmark Results (1,000,000 Records)
 
-Workload: 10,000 structured IoT/Sensor records with schema `(timestamp INT64, sensor_id INT32, reading FLOAT64, status INT32)` inside an explicit transaction (`PRAGMA page_size = 4096`, `synchronous = OFF`, `journal_mode = MEMORY`).
+Workload: 1,000,000 structured IoT/Sensor records with schema `(timestamp INT64, sensor_id INT32, reading FLOAT64, status INT32)` inside an explicit transaction (`PRAGMA page_size = 4096`, `synchronous = OFF`, `journal_mode = MEMORY`).
 
 | Metric | Standard SQLite (`0x0D`) | Fixed-Schema Storage (`0x0E`) | Gain / Advantage |
 |---|---|---|---|
-| **Database File Size** | **294,912 bytes** | **253,952 bytes** | **-13.89% SPACE (-40,960 bytes saved)** |
-| **Total 4KB Pages Allocated** | 72 pages | 62 pages (60 FSS leaves, 1 interior) | **-10 pages saved** |
-| **INSERT Throughput** | ~3,530,000 ops/sec | ~2,930,000 ops/sec | **0.83x (Direct single-pass slot streaming)** |
-| **SELECT Point Lookups** | ~186,000 queries/sec | ~192,000 queries/sec | **1.03x FASTER ($O(1)$ direct slot math, zero varints)** |
-| **UPDATE In-Place Throughput** | ~3,340,000 updates/sec | ~3,110,000 updates/sec | **0.93x (Near parity via cursor slot overwrite)** |
-| **Data Consistency** | 10,000 rows | 10,000 rows | **100% Match Verified (`integrity_check` ok)** |
+| **Database File Size** | **29,536,256 bytes** | **24,453,120 bytes** | **-17.21% SPACE (-5,083,136 bytes saved)** |
+| **Total 4KB Pages Allocated** | 7,211 pages | 5,970 pages (5,953 FSS leaves, 16 interior) | **-1,241 pages saved** |
+| **INSERT Throughput** | ~3,200,000 ops/sec | ~2,980,000 ops/sec | **0.93x (Direct single-pass slot streaming)** |
+| **SELECT Point Lookups** | ~190,000 queries/sec | ~191,000 queries/sec | **1.01x FASTER ($O(1)$ direct slot math, zero varints)** |
+| **UPDATE In-Place Throughput** | ~2,900,000 updates/sec | ~2,650,000 updates/sec | **0.92x (Near parity via cursor slot overwrite)** |
+| **Data Consistency** | 1,000,000 rows | 1,000,000 rows | **100% Match Verified (`integrity_check` ok)** |
 
 ---
 

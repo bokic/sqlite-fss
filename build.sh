@@ -76,7 +76,7 @@ gcc -O2 -I"${SCRIPT_DIR}/src" -I"${SQLITE_DIR}" \
     -lpthread -ldl -lm \
     -o "${SCRIPT_DIR}/bin/test_fss_pragma"
 
-# 4c. 10,000 records benchmark (INSERT, SELECT, UPDATE, Disk Space comparison)
+# 4c. 1,000,000 records benchmark (INSERT, SELECT, UPDATE, Disk Space comparison)
 gcc -O2 -I"${SCRIPT_DIR}/src" -I"${SQLITE_DIR}" \
     "${SCRIPT_DIR}/benchmark/benchmark.c" "${SCRIPT_DIR}/src/fss.c" "${SQLITE_DIR}/sqlite3.o" \
     -lpthread -ldl -lm \
@@ -97,7 +97,7 @@ echo "--- [B] Running PRAGMA Tests ---"
 "${SCRIPT_DIR}/bin/test_fss_pragma"
 
 echo ""
-echo "--- [C] Running 10,000 Operations Benchmark ---"
+echo "--- [C] Running 1,000,000 Operations Benchmark ---"
 "${SCRIPT_DIR}/bin/benchmark"
 
 echo ""
